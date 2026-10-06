@@ -1,0 +1,681 @@
+[25.09.2026 23:55] Fima Shagal: Create a TypeScript library for browsers that provides a high-level runtime for dynamically executing CPU-intensive JavaScript/TypeScript tasks using Web Workers.
+The main idea is that developers should not need to manually create Worker files, manage Worker instances, communicate through postMessage, correlate messages with promises, or manage a worker pool.
+The library should expose a simple task-oriented API while internally managing dynamic Web Workers.
+Working concept:
+const runtime = createRuntime({
+minWorkers: 0,
+maxWorkers: "auto"
+});
+const collatz = runtime.task((n: number) => {
+let steps = 0;
+while (n !== 1) {
+n = n % 2 === 0
+? n / 2
+: 3 * n + 1;
+steps++;
+}
+return steps;
+});
+const result = await collatz(27);
+The developer should think in terms of tasks/jobs, not Worker instances.
+==================================================
+PROJECT GOALS
+==================================================
+Build a small, dependency-light TypeScript library that:
+dynamically creates Web Workers when computational work is submitted
+does not require users to manually create worker files for the basic API
+maintains a reusable worker pool
+schedules jobs across available workers
+automatically creates additional workers when necessary
+terminates unused workers after an idle timeout
+exposes Promise-based task execution
+supports synchronous and async task functions
+supports multiple arguments and return values
+propagates errors from workers
+supports task cancellation using AbortSignal
+supports task timeouts
+exposes runtime statistics
+can cleanly shut down all workers
+has strong TypeScript typings
+keeps the internal architecture extensible
+The library should initially target modern browsers.
+Node.js worker_threads support is NOT required for the MVP, but the architecture should make alternative worker backends possible later.
+==================================================
+2. CORE DESIGN PRINCIPLE
+Web Workers should be treated as an implementation detail.
+Do NOT design the public API around:
+new Worker(...)
+worker.postMessage(...)
+worker.onmessage(...)
+Instead design around:
+runtime.task(...)
+task(...)
+task.map(...)
+runtime.stats()
+runtime.shutdown()
+The runtime owns all workers.
+==================================================
+3. BASIC PUBLIC API
+Main entry point:
+const runtime = createRuntime(options);
+Runtime options:
+interface RuntimeOptions {
+minWorkers?: number;
+maxWorkers?: number | "auto";
+idleTimeout?: number;
+taskTimeout?: number;
+}
+Defaults:
+minWorkers = 0
+maxWorkers = navigator.hardwareConcurrency || 4
+idleTimeout = 10_000
+taskTimeout = 0
+taskTimeout = 0 means no timeout.
+Example:
+const runtime = createRuntime({
+minWorkers: 0,
+maxWorkers: "auto",
+idleTimeout: 5000
+});
+==================================================
+4. TASK CREATION
+The primary API should be:
+const task = runtime.task(fn);
+Example:
+const square = runtime.task(
+(value: number) => value * value
+);
+const result = await square(12);
+result === 144
+TypeScript should infer input and output types.
+Example:
+const add = runtime.task(
+(a: number, b: number): number => a + b
+);
+const result = await add(10, 20);
+The returned task must be callable like a normal async function.
+Conceptually:
+type RuntimeTask = (...args: Parameters) =>
+Promise<Awaited<ReturnType>>;
+Async functions should also work:
+const task = runtime.task(async (value: number) => {
+return await someOperation(value);
+});
+==================================================
+5. DYNAMIC WORKER CREATION
+The MVP should NOT require a physical worker.js file.
+Generate a generic Worker runtime dynamically.
+Suggested mechanism:
+Store the internal worker runtime source as a string.
+Create a Blob:
+new Blob([workerSource], {
+type: "text/javascript"
+});
+Create an object URL:
+URL.createObjectURL(blob)
+Spawn workers using:
+[25.09.2026 23:55] Fima Shagal: new Worker(workerURL)
+The same generated worker URL should be reusable for multiple Worker instances.
+Do NOT generate an entirely new Blob for every job.
+Revoke the object URL when the runtime is permanently shut down.
+==================================================
+6. TASK SERIALIZATION
+For the MVP, serialize task functions using:
+fn.toString()
+The worker runtime receives the function source and reconstructs the function.
+However, document and explicitly handle the important limitation:
+Closures cannot be automatically serialized.
+This works:
+runtime.task(
+(x: number) => x * 10
+);
+This does NOT reliably work:
+const multiplier = 10;
+runtime.task(
+(x: number) => x * multiplier
+);
+Because multiplier does not exist inside the Worker realm.
+The implementation should detect execution failures caused by missing external variables and propagate a meaningful worker error.
+Do not attempt to solve arbitrary closure serialization in the MVP.
+Design task registration in such a way that a future module-based task backend could replace function serialization.
+==================================================
+7. TASK REGISTRATION
+Each task should receive an internal unique task ID.
+Example internal representation:
+{
+taskId: "task_1",
+source: "(n) => n * n"
+}
+Workers should maintain a task registry:
+Map<string, Function>
+When a worker is created, registered tasks can be sent to it.
+Alternatively, tasks may be registered lazily when first required by a worker.
+Prefer lazy registration if it keeps the implementation clean.
+After registration, jobs should only need to send:
+{
+type: "execute",
+jobId,
+taskId,
+args
+}
+instead of sending the function source for every execution.
+==================================================
+8. JOB MODEL
+Every task invocation creates a Job.
+Internal Job structure should contain approximately:
+interface Job {
+id: string;
+taskId: string;
+args: unknown[];
+resolve: (value: unknown) => void;
+reject: (error: Error) => void;
+createdAt: number;
+signal?: AbortSignal;
+timeout?: number;
+}
+Jobs waiting for execution should be stored in a scheduler queue.
+==================================================
+9. WORKER POOL
+Create an internal WorkerPool.
+Each managed worker should have state similar to:
+interface WorkerInstance {
+id: string;
+worker: Worker;
+state:
+| "idle"
+| "busy"
+| "terminated";
+currentJobId?: string;
+lastUsedAt: number;
+registeredTasks: Set;
+}
+The pool should know:
+number of workers
+idle workers
+busy workers
+queued jobs
+==================================================
+10. SCHEDULER
+Implement a scheduler responsible for assigning queued jobs to workers.
+Basic algorithm:
+When a job arrives:
+If an idle worker exists:
+assign the job to it.
+Otherwise, if currentWorkers < maxWorkers:
+spawn a new worker and assign the job.
+Otherwise:
+put the job into the queue.
+When a worker finishes:
+resolve/reject the current job
+check the queue
+if another job exists, execute it immediately
+otherwise mark worker as idle
+The scheduler should be implemented as a separate internal component rather than being mixed into Runtime.
+==================================================
+11. AUTO SCALING
+Workers should be created on demand.
+Example:
+runtime starts:
+workers = 0
+One task arrives:
+workers = 1
+Eight expensive tasks arrive:
+workers can grow toward maxWorkers.
+After work finishes, workers become idle.
+If an idle worker remains unused longer than idleTimeout, terminate it.
+Never shrink below minWorkers.
+Example:
+minWorkers = 1
+maxWorkers = 8
+The runtime may scale:
+1 -> 2 -> 3 -> 4 -> ... -> 8
+and later:
+8 -> 7 -> 6 -> ... -> 1
+Do not terminate busy workers.
+==================================================
+12. MAP API
+Tasks should support:
+const square = runtime.task(
+(n: number) => n * n
+);
+const results = await square.map([
+1,
+[25.09.2026 23:55] Fima Shagal: 2,
+3,
+4,
+5
+]);
+Expected:
+[1, 4, 9, 16, 25]
+The order of results MUST correspond to the order of inputs even if workers complete jobs in a different order.
+For MVP, map() may simply submit multiple jobs through the scheduler.
+Design it so automatic batching can be implemented later.
+For multi-argument tasks, optionally support tuples:
+const add = runtime.task(
+(a: number, b: number) => a + b
+);
+await add.map([
+[1, 2],
+[10, 20],
+[100, 200]
+]);
+Expected:
+[3, 30, 300]
+If implementing generic typing for this makes the MVP unnecessarily complex, prioritize the single-argument map API first.
+==================================================
+13. ABORTSIGNAL / CANCELLATION
+Support standard AbortSignal rather than inventing a custom cancellation API.
+Example desired API:
+await task.run(value, {
+signal: controller.signal
+});
+controller.abort();
+Because callable tasks cannot distinguish normal task arguments from execution options cleanly, provide both:
+task(...args)
+and:
+task.run(args, options)
+Choose a clean strongly typed API.
+One acceptable design:
+task.run([arg1, arg2], {
+signal,
+timeout
+});
+Example:
+await collatz.run([27], {
+signal: controller.signal
+});
+Cancellation behavior:
+If the job is still queued:
+remove it from the queue
+reject with AbortError
+If the job is already running:
+for MVP it is acceptable to terminate the worker
+reject the job with AbortError
+replace the terminated worker if required by minWorkers or queued work
+Document this behavior clearly.
+Future versions may support cooperative cancellation without killing the worker.
+==================================================
+14. TIMEOUTS
+Support per-job timeout:
+await task.run([value], {
+timeout: 5000
+});
+If the task does not finish within the timeout:
+terminate the worker executing it
+reject the job with a TaskTimeoutError
+allow the pool to spawn a replacement worker
+Runtime-level taskTimeout acts as the default.
+Per-job timeout overrides it.
+==================================================
+15. ERROR PROPAGATION
+Worker errors must be serialized and returned to the main thread.
+Preserve when possible:
+name
+message
+stack
+Example worker response:
+{
+type: "error",
+jobId,
+error: {
+name,
+message,
+stack
+}
+}
+Reconstruct an Error-like object on the main thread.
+A failed task must NOT break the entire runtime.
+The worker should remain reusable after a normal thrown exception.
+Only fatal worker failures should cause the worker to be replaced.
+==================================================
+16. WORKER CRASH RECOVERY
+Handle:
+worker.onerror
+worker.onmessageerror
+If a worker unexpectedly dies or becomes unusable:
+reject its current job with WorkerCrashedError
+remove the worker from the pool
+continue processing remaining jobs
+spawn a replacement when necessary
+One worker failure must not destroy the runtime.
+==================================================
+17. RUNTIME STATISTICS
+Expose:
+runtime.stats()
+Suggested result:
+interface RuntimeStats {
+workers: number;
+busyWorkers: number;
+idleWorkers: number;
+queuedJobs: number;
+runningJobs: number;
+completedJobs: number;
+failedJobs: number;
+averageWaitTime: number;
+averageExecutionTime: number;
+}
+Stats do not need to be perfect profiling metrics.
+Keep the implementation lightweight.
+==================================================
+18. SHUTDOWN
+Support:
+await runtime.shutdown();
+Shutdown should:
+stop accepting new jobs
+reject queued jobs
+terminate workers
+clear timers
+revoke Blob URLs
+remove event listeners where appropriate
+release internal references
+Calling tasks after shutdown should throw RuntimeShutdownError.
+Optionally support:
+runtime.shutdown({
+graceful: true
+});
+where graceful shutdown waits for currently running jobs before terminating workers.
+If graceful shutdown adds significant complexity, implement immediate shutdown first and leave graceful shutdown as a documented extension point.
+[25.09.2026 23:55] Fima Shagal: ==================================================
+19. TRANSFERABLE OBJECTS
+Design the architecture so transferable objects can be supported.
+For the MVP, optionally implement:
+task.run([data], {
+transfer: [data.buffer]
+});
+Internally:
+worker.postMessage(message, transferables);
+Do not overcomplicate automatic transferable detection in the first version.
+Explicit transfer lists are sufficient.
+==================================================
+20. INTERNAL ARCHITECTURE
+Keep components separated.
+Suggested structure:
+src/
+index.ts
+runtime/
+Runtime.ts
+RuntimeTask.ts
+workers/
+WorkerPool.ts
+WorkerInstance.ts
+WorkerFactory.ts
+workerSource.ts
+scheduler/
+Scheduler.ts
+JobQueue.ts
+protocol/
+messages.ts
+errors/
+RuntimeError.ts
+TaskTimeoutError.ts
+WorkerCrashedError.ts
+RuntimeShutdownError.ts
+utils/
+ids.ts
+timing.ts
+Do not treat this exact structure as mandatory if a cleaner architecture emerges.
+Important principle:
+Runtime
+-> Scheduler
+-> WorkerPool
+-> WorkerInstance
+-> Web Worker
+Protocol types should be isolated from runtime logic.
+==================================================
+21. WORKER PROTOCOL
+Create a typed internal message protocol.
+Main -> Worker:
+REGISTER_TASK
+{
+type: "REGISTER_TASK",
+taskId,
+source
+}
+EXECUTE
+{
+type: "EXECUTE",
+jobId,
+taskId,
+args
+}
+Worker -> Main:
+TASK_REGISTERED
+TASK_RESULT
+{
+type: "TASK_RESULT",
+jobId,
+result
+}
+TASK_ERROR
+{
+type: "TASK_ERROR",
+jobId,
+error
+}
+Avoid loosely structured arbitrary message objects throughout the codebase.
+Use discriminated TypeScript unions.
+==================================================
+22. SECURITY / CSP
+Document that the dynamic Blob Worker approach can be restricted by a website's Content Security Policy.
+Do not hide this limitation.
+The architecture should allow a future mode such as:
+createRuntime({
+workerUrl: "/my-worker.js"
+});
+or:
+createRuntime({
+backend: moduleWorkerBackend(...)
+});
+This will allow applications with strict CSP policies to use a statically hosted worker entry point.
+Do not implement a large backend abstraction unnecessarily, but avoid tightly coupling every component to Blob workers.
+==================================================
+23. FUTURE EXTENSIONS
+Do NOT implement all of these in the MVP, but design the code so they are possible later:
+priority queues
+automatic batching
+streaming results
+worker services
+stateful workers
+dedicated/reserved workers
+task affinity
+cooperative cancellation
+retries
+scheduling strategies
+work stealing
+Node.js worker_threads backend
+Deno backend
+Bun backend
+module workers
+WASM workers
+OffscreenCanvas helpers
+automatic Transferable detection
+SharedArrayBuffer
+task progress events
+runtime event system
+worker warmup
+task preloading
+worker health checks
+persistent worker services
+devtools/debugger
+performance tracing
+Especially avoid architectural decisions that would make alternative execution backends impossible.
+==================================================
+24. PERFORMANCE PRINCIPLES
+Avoid unnecessary copies and allocations.
+Do not recreate workers for every task.
+Do not resend task source on every execution once a worker knows the task.
+Do not poll workers continuously.
+Use events/messages.
+Worker creation should happen only when necessary.
+The runtime itself should remain lightweight.
+Do not introduce large dependencies for functionality that can reasonably be implemented internally.
+==================================================
+25. TESTING
+Create tests covering at minimum:
+single task execution
+multiple arguments
+async task
+task returning object
+thrown errors
+multiple simultaneous jobs
+worker reuse
+dynamic worker creation
+maxWorkers enforcement
+idle worker termination
+minWorkers enforcement
+map()
+ordered map results
+queued cancellation
+running cancellation
+timeout
+worker crash recovery
+runtime shutdown
+[25.09.2026 23:55] Fima Shagal: task invocation after shutdown
+Where browser Worker behavior is required, use an appropriate browser test environment rather than relying entirely on fake workers.
+==================================================
+26. DOCUMENTATION
+Create a README containing:
+Installation
+npm install
+Basic example
+const runtime = createRuntime();
+const square = runtime.task(
+(n: number) => n * n
+);
+console.log(await square(12));
+Parallel example
+const calculate = runtime.task(expensiveFunction);
+const results = await calculate.map(values);
+Runtime configuration
+Cancellation
+Timeouts
+Transferable objects if implemented
+Runtime statistics
+Shutdown
+Important limitations:
+closures
+structured clone restrictions
+CSP
+worker startup overhead
+browser support
+Explain when Web Workers are useful and when they are not.
+Do not claim that workers make arbitrary asynchronous code faster.
+Explain that the primary benefit is moving CPU-heavy work away from the main thread and parallelizing suitable workloads.
+==================================================
+27. BUILD
+Use TypeScript.
+Produce modern ESM output.
+The package should be tree-shakeable.
+Generate TypeScript declarations.
+Keep browser globals isolated enough that importing the package does not immediately spawn workers.
+No workers should exist until a Runtime instance requires them, except when minWorkers explicitly requests prewarming.
+Provide npm scripts for:
+build
+test
+typecheck
+lint
+Use a modern lightweight build setup.
+==================================================
+28. CODE QUALITY
+Requirements:
+strict TypeScript
+no unnecessary any
+clear naming
+small focused classes/modules
+documented public API
+no giant god class
+no unnecessary framework
+no premature abstraction
+no dependency injection framework
+no global singleton runtime
+multiple independent Runtime instances must work
+deterministic cleanup
+meaningful custom errors
+Prefer understandable code over clever code.
+==================================================
+29. MVP ACCEPTANCE EXAMPLE
+The following should work:
+const runtime = createRuntime({
+minWorkers: 0,
+maxWorkers: 4,
+idleTimeout: 5000
+});
+const collatz = runtime.task((start: number) => {
+let n = start;
+let steps = 0;
+while (n !== 1) {
+n = n % 2 === 0
+? n / 2
+: n * 3 + 1;
+steps++;
+}
+return steps;
+});
+const result = await collatz(27);
+console.log(result);
+const results = await collatz.map([
+27,
+31,
+63,
+127,
+255
+]);
+console.log(results);
+console.log(runtime.stats());
+await runtime.shutdown();
+The application should never directly instantiate or communicate with a Web Worker.
+==================================================
+30. IMPLEMENTATION APPROACH
+Before writing code:
+Analyze the specification.
+Identify browser/platform constraints that affect the design.
+Define the public TypeScript API.
+Define the internal worker message protocol.
+Define Runtime, Scheduler and WorkerPool responsibilities.
+Explain any changes you recommend to this specification.
+Then implement the MVP incrementally.
+Do not implement speculative features before the core execution pipeline works.
+Recommended implementation order:
+Phase 1:
+dynamic Worker creation
+worker protocol
+single task execution
+Phase 2:
+task registry
+Promise/job correlation
+worker reuse
+Phase 3:
+WorkerPool
+Scheduler
+queue
+dynamic scaling
+Phase 4:
+map()
+timeouts
+AbortSignal
+Phase 5:
+crash recovery
+stats
+shutdown
+cleanup
+Phase 6:
+tests
+README
+package build
+The final result should feel like a small compute runtime rather than a thin wrapper around Web Worker.
+The conceptual abstraction is:
+developer
+↓
+Task
+↓
+Job
+↓
+Scheduler
+↓
+Worker Pool
+↓
+Web Workers
+The most important API design goal is:
+"I have work to execute in parallel."
+not:
+"I want to manage Web Workers."
