@@ -8,18 +8,26 @@ export default defineConfig({
     target: "es2022",
     sourcemap: true,
     lib: {
-      entry: resolve(__dirname, "src/index.ts"),
-      name: "AhWork",
+      // Two entries, one per worker backend. Consumers never pick by hand:
+      // package.json `exports` routes Node to the worker_threads build and
+      // everything else to the Web Worker one.
+      entry: {
+        ahwork: resolve(__dirname, "src/index.ts"),
+        "ahwork.node": resolve(__dirname, "src/index.node.ts"),
+      },
       formats: ["es"],
-      fileName: () => "ahwork.js",
+      fileName: (_format, name) => `${name}.js`,
     },
     rollupOptions: {
-      // Keep the bundle dependency-free; nothing external is expected for the MVP.
-      external: [],
+      // Keep the bundle dependency-free. `node:worker_threads` is a built-in
+      // and must stay external; it only ever loads in the Node entry.
+      external: [/^node:/],
     },
   },
   plugins: [
     dts({
+      // One rolled-up .d.ts per entry, so the Node build can advertise the
+      // extra `nodeWorkerPrelude` export without leaking it into the web one.
       rollupTypes: true,
       include: ["src"],
     }),

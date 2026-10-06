@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { ManagedWorker } from "../src/workers/WorkerInstance";
+import type { WorkerLike } from "../src/workers/WorkerBackend";
 import { RuntimeError } from "../src/errors/RuntimeError";
 import type { Job } from "../src/scheduler/Job";
 
@@ -42,7 +43,7 @@ describe("ManagedWorker registration integrity (P1 #1, #3)", () => {
     const raw = new FlakyWorker();
     const worker = new ManagedWorker(
       "w1",
-      raw as unknown as Worker,
+      raw as unknown as WorkerLike,
       () => ({ source: "(x) => x", hasContext: true, context: {} }),
       noopCallbacks,
     );
@@ -72,7 +73,7 @@ describe("ManagedWorker registration integrity (P1 #1, #3)", () => {
     }
     const worker = new ManagedWorker(
       "w1",
-      new SilentWorker() as unknown as Worker,
+      new SilentWorker() as unknown as WorkerLike,
       () => {
         throw new RuntimeError("Unknown task for id: t1");
       },
@@ -99,7 +100,7 @@ describe("ManagedWorker registration integrity (P1 #1, #3)", () => {
     }
     const worker = new ManagedWorker(
       "w1",
-      new RecordingWorker() as unknown as Worker,
+      new RecordingWorker() as unknown as WorkerLike,
       () => ({ source: "(x) => x", hasContext: false }),
       noopCallbacks,
     );

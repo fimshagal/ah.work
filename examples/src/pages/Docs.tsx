@@ -58,6 +58,9 @@ const RUNTIME_STATS = `interface RuntimeStats {
 }`;
 
 const EXPORTS = `export { createRuntime, workerSourceCode } from "ahwork";
+// Node build only:
+export { nodeWorkerPrelude } from "ahwork";
+
 export type {
   Runtime,
   RuntimeOptions,
@@ -69,6 +72,7 @@ export type {
   TaskOptions,
   InjectOptions,
   InjectMap,
+  TransferableValue,
 };
 export {
   RuntimeError,
@@ -95,6 +99,72 @@ export function Docs() {
       <p>
         Creates an independent runtime. Importing the module does not spawn
         workers.
+      </p>
+
+      <h2>Backends</h2>
+      <p>
+        The same <code>createRuntime</code> runs on two worker implementations.
+        You never choose: conditional exports in <code>package.json</code> route{" "}
+        <code>import {"{ createRuntime }"} from &quot;ahwork&quot;</code> to the
+        right build. Everything above the backend — tasks, <code>context</code>,{" "}
+        <code>inject</code>, <code>map</code>, timeouts, <code>AbortSignal</code>,
+        retries, auto-scaling, stats, shutdown, transfer lists — is shared code
+        and behaves identically.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Browser</th>
+            <th>Node 18+</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Worker</td>
+            <td>
+              <code>new Worker(blob:)</code>
+            </td>
+            <td>
+              <code>worker_threads</code>, <code>{"{ eval: true }"}</code>
+            </td>
+          </tr>
+          <tr>
+            <td>Entry</td>
+            <td>
+              <code>dist/ahwork.js</code> · <code>ahwork/browser</code>
+            </td>
+            <td>
+              <code>dist/ahwork.node.js</code> · <code>ahwork/node</code>
+            </td>
+          </tr>
+          <tr>
+            <td>Keeps the host alive</td>
+            <td>
+              <em>—</em>
+            </td>
+            <td>
+              Only while a job is in flight. An idle pool is{" "}
+              <code>unref</code>&apos;d, so a forgotten{" "}
+              <code>shutdown()</code> never pins the process, and an{" "}
+              <code>await</code> never races process exit.
+            </td>
+          </tr>
+          <tr>
+            <td>Silent worker death</td>
+            <td>Job hangs — the platform reports nothing</td>
+            <td>
+              <code>exit</code> fires, so the job rejects with{" "}
+              <code>WorkerCrashedError</code>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        This page runs in a browser, so every runnable example on this site uses
+        the Web Worker backend. The Node backend is covered by its own execution
+        suite (<code>npm run test:node</code>), which overlaps the browser one on
+        purpose.
       </p>
 
       <h2>RuntimeOptions</h2>
@@ -134,7 +204,9 @@ export function Docs() {
               <code>&quot;auto&quot;</code>
             </td>
             <td>
-              <code>navigator.hardwareConcurrency || 4</code>. Always ≥ 1.
+              Available cores: <code>navigator.hardwareConcurrency</code> in the
+              browser, <code>os.availableParallelism()</code> on Node. Falls
+              back to <code>4</code>. Always ≥ 1.
             </td>
           </tr>
           <tr>
@@ -224,9 +296,11 @@ export function Docs() {
               <em>—</em>
             </td>
             <td>
-              Use a statically hosted worker entry instead of a{" "}
-              <code>blob:</code> URL (strict-CSP escape hatch). Host the{" "}
-              <code>workerSourceCode</code> export.
+              Use a worker entry you host yourself. In the browser: a URL
+              serving <code>workerSourceCode</code>, instead of a{" "}
+              <code>blob:</code> URL (strict-CSP escape hatch). On Node: a file
+              path or <code>file:</code> URL, whose contents must be{" "}
+              <code>nodeWorkerPrelude + workerSourceCode</code>.
             </td>
           </tr>
         </tbody>
@@ -420,11 +494,13 @@ export function Docs() {
               <code>transfer</code>
             </td>
             <td>
-              <code>Transferable[]</code>
+              <code>TransferableValue[]</code>
             </td>
             <td>
               Explicit transfer list for <code>postMessage</code> (merged with
-              auto-detected ones when <code>autoTransfer</code> is on).
+              auto-detected ones when <code>autoTransfer</code> is on). Not the
+              DOM&apos;s <code>Transferable</code>: these types also ship in the
+              Node build, where <code>lib.dom</code> does not exist.
             </td>
           </tr>
           <tr>
@@ -528,7 +604,12 @@ export function Docs() {
       <p>
         <code>workerSourceCode</code> is the raw worker runtime text — host it
         as a <code>.js</code> file and pass its URL via{" "}
-        <code>createRuntime({"{ workerUrl }"})</code> under a strict CSP.
+        <code>createRuntime({"{ workerUrl }"})</code> under a strict CSP. The
+        Node build adds one export, <code>nodeWorkerPrelude</code>: the shim
+        that gives that same source a <code>self</code> to attach to under{" "}
+        <code>worker_threads</code>. You only need it if you host the worker
+        file yourself; the default <code>{"{ eval: true }"}</code> path prepends
+        it for you.
       </p>
     </Layout>
   );

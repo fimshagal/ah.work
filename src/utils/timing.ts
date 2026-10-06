@@ -5,6 +5,17 @@ export function now(): number {
     : Date.now();
 }
 
+/**
+ * Mark a background timer as not worth keeping the host alive for.
+ *
+ * Node's timers expose `unref`; the DOM's numeric handles do not, so this is a
+ * no-op in the browser. Used for housekeeping timers (idle-worker reaping)
+ * that should never be the reason a Node process refuses to exit.
+ */
+export function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  (timer as unknown as { unref?: () => void }).unref?.();
+}
+
 /** Incremental running average, used for lightweight runtime statistics. */
 export class RunningAverage {
   private count = 0;

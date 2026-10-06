@@ -1,4 +1,22 @@
 /**
+ * Prelude that lets {@link workerSource} run unchanged under Node's
+ * `worker_threads`, where there is no `self` — only `parentPort`.
+ *
+ * Note what this deliberately does *not* do: declare `var self`. Such a
+ * declaration is hoisted, so `typeof self` inside its own initializer would be
+ * `"undefined"` in browsers too, and the shim would hijack a perfectly good
+ * global. Assigning onto `globalThis` keeps the browser path untouched.
+ *
+ * `parentPort` supports the `onmessage` setter (and starts the port on
+ * assignment), so the body below needs no Node-specific branch at all.
+ */
+export const nodeWorkerPrelude = `
+if (typeof self === "undefined") {
+  globalThis.self = require("node:worker_threads").parentPort;
+}
+`;
+
+/**
  * Source code of the generic worker runtime, stored as a string.
  *
  * It is turned into a Blob URL once per WorkerFactory and reused for every

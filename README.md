@@ -3,7 +3,8 @@
 Run CPU-heavy JavaScript off the main thread without ever touching a `Worker`.
 
 AhWork is a small, dependency-free TypeScript runtime that executes expensive
-tasks on a pool of Web Workers it manages for you.
+tasks on a pool of workers it manages for you — Web Workers in the browser,
+`worker_threads` on Node, same API either way.
 
 **The problem.** Raw Web Workers make you rebuild the same plumbing every time:
 spawn a worker, invent a message protocol, match replies to requests, handle the
@@ -19,8 +20,8 @@ you never call `new Worker`, `postMessage`, or `onmessage`.
 > `AbortSignal`, `context`, `inject`, stats, crash replacement, immediate and
 > graceful shutdown (with timeout + escalation), option validation, backpressure
 > (`maxQueue`), per-job `retries`, automatic transferable detection
-> (`autoTransfer`), a static-worker backend (`workerUrl`) and `task.dispose()`.
-> See [`plan.md`](./plan.md).
+> (`autoTransfer`), a static-worker backend (`workerUrl`), `task.dispose()` and
+> a Node `worker_threads` backend. See [`plan.md`](./plan.md).
 >
 > **Not yet:** a module backend for real `import`s inside workers, a build plugin
 > for transparent closures, automatic `dist/ahwork.worker.js` emission, and the
@@ -28,8 +29,57 @@ you never call `new Worker`, `postMessage`, or `onmessage`.
 
 ## Requirements
 
-Modern browsers with Web Worker support. The Blob-worker approach may be
-restricted by a strict Content Security Policy — see [Limitations](#limitations).
+A modern browser with Web Worker support, or Node 18+. Nothing else — the
+library has zero runtime dependencies.
+
+## Backends
+
+The same `createRuntime` runs on two different worker implementations. You do
+not pick one: `package.json` conditional exports route `import { createRuntime }
+from "ahwork"` to the right build, and your code does not change.
+
+| | Browser | Node |
+| --- | --- | --- |
+| Worker | `new Worker(blob:)` | `new Worker(source, { eval: true })` |
+| Entry | `dist/ahwork.js` | `dist/ahwork.node.js` |
+| `maxWorkers: "auto"` | `navigator.hardwareConcurrency` | `os.availableParallelism()` (honours container CPU limits) |
+| `workerUrl` | URL of a hosted script (CSP escape hatch) | path or `file:` URL of a worker file |
+| Keeps the host alive | n/a | only while a job is in flight |
+
+Everything above the backend — tasks, `context`, `inject`, `map`, timeouts,
+`AbortSignal`, retries, auto-scaling, stats, graceful shutdown, transfer
+lists — is shared code and behaves identically. `test/browser` and `test/node`
+run overlapping suites to keep it that way.
+
+If you need to be explicit (bundler quirks, dual-target tooling), the two builds
+are also reachable directly as `ahwork/browser` and `ahwork/node`.
+
+### On Node
+
+```ts
+import { createRuntime } from "ahwork"; // resolves to the worker_threads build
+
+const runtime = createRuntime({ maxWorkers: 4 });
+
+const hash = runtime.task((input: string) => {
+  let h = 0;
+  for (let i = 0; i < input.length; i++) h = (h * 31 + input.charCodeAt(i)) | 0;
+  return h;
+});
+
+console.log(await hash.map(["a", "b", "c"]));
+```
+
+Note there is no `shutdown()` in that snippet and the process still exits. An
+idle pool is `unref`'d, so it never keeps Node alive by itself; a worker is
+`ref`'d again for exactly as long as it has a job in flight, so `await` never
+races process exit. Call `shutdown()` when you want the workers gone at a
+specific moment (tests, a draining server) rather than whenever the process
+ends.
+
+Node gives the runtime one thing the browser cannot: a worker that dies
+*without* throwing — an OOM kill, a stray `process.exit()` — emits `exit`, so
+the job rejects with `WorkerCrashedError` instead of hanging forever.
 
 ## Install (local dev)
 
@@ -43,8 +93,9 @@ npm install
 | ------------------- | --------------------------------------------- |
 | `npm run examples`  | Start the local docs site (Home / Examples / Demo / Tutorial / API) |
 | `npm test`          | Unit tests in jsdom (no real Web Workers)     |
+| `npm run test:node` | Execution tests on real `node:worker_threads` |
 | `npm run test:browser` | Execution tests in Chromium via Playwright |
-| `npm run test:all`  | Unit tests, then browser tests                |
+| `npm run test:all`  | Unit, then Node, then browser tests           |
 | `npm run typecheck` | Type-check with `tsc --noEmit`                |
 | `npm run build`     | Build the library (ESM + `.d.ts`)             |
 | `npm run lint`      | Lint with ESLint                              |
@@ -52,6 +103,10 @@ npm install
 `npm test` is fast and does **not** start Chrome. It checks types of the API,
 the scheduler, timeouts/abort bookkeeping and fake workers. jsdom has no real
 `Worker`, so it cannot run `fn.toString()` inside a blob worker.
+
+`npm run test:node` runs the execution suite on real `worker_threads` — no
+browser needed, so it is the fast way to check that a change to the shared
+scheduler still works against a real worker.
 
 `npm run test:browser` opens headless Chromium (Playwright) and runs the same
 kind of work as the examples page: real workers, `map`, timeout, abort, crash,
@@ -568,7 +623,7 @@ URL.revokeObjectURL(workerUrl);
 ```ts
 createRuntime({
   minWorkers: 0,        // workers kept warm; prewarmed on creation. Default: 0
-  maxWorkers: "auto",   // upper bound; "auto" = navigator.hardwareConcurrency || 4
+  maxWorkers: "auto",   // upper bound; "auto" = available cores (see Backends)
   idleTimeout: 10_000,  // ms an idle worker lives before termination (0 = never)
   taskTimeout: 0,       // default per-task timeout (ms); 0 = no timeout
   maxQueue: 0,          // max waiting jobs (backpressure); 0 = unbounded
@@ -585,14 +640,15 @@ back to their defaults.
 Multiple independent runtimes can coexist; there is no global singleton.
 
 `await runtime.shutdown()` is immediate: queued and running jobs reject with
-`RuntimeShutdownError`, workers die, the blob URL is revoked.
+`RuntimeShutdownError`, workers die, and any backend resource (the browser's
+blob URL) is released.
 `await runtime.shutdown({ graceful: true })` still rejects jobs that have not
 started, but waits for jobs that are already running. Add
 `{ graceful: true, timeout }` to force-stop stragglers after a deadline.
 Shutdown is idempotent (first call wins); a later immediate `shutdown()`
 **escalates** a pending graceful one.
 
-## When are Web Workers useful?
+## When are workers useful?
 
 Workers move **CPU-heavy** work off the main thread and let suitable workloads
 run in parallel across cores. They do **not** make arbitrary asynchronous code
@@ -601,6 +657,11 @@ per-job serialization and worker-startup overhead.
 
 Rule of thumb: if deleting that computation would make your UI smooth again, it
 belongs in a worker. If the function mostly waits on the network, it does not.
+
+On a server the same rule reads differently but means the same thing: one
+synchronous 200 ms computation blocks the event loop, so *every* concurrent
+request waits 200 ms. Moving it to the pool keeps the loop answering while the
+work happens elsewhere.
 
 ## Limitations
 
@@ -619,10 +680,15 @@ reading once before you adopt the library.
   worker — see the note under the `inject` example.
 - **Structured clone restrictions.** Arguments/results must be structured-clone
   compatible (no functions, DOM nodes, or class instances with methods).
-- **CSP.** The default `blob:` worker can be blocked by a strict Content
-  Security Policy (`worker-src` / `script-src`). Workaround: host the exported
-  `workerSourceCode` as a static file and pass `createRuntime({ workerUrl })`.
-  A failed worker creation rejects with `WorkerSpawnError`.
+- **CSP (browser only).** The default `blob:` worker can be blocked by a strict
+  Content Security Policy (`worker-src` / `script-src`). Workaround: host the
+  exported `workerSourceCode` as a static file and pass
+  `createRuntime({ workerUrl })`. A failed worker creation rejects with
+  `WorkerSpawnError`. Node has no equivalent restriction.
+- **No shared memory.** Each worker is an isolated realm with its own heap; a
+  `context` is a real per-worker copy, and nothing is shared between tasks
+  except what you pass per call. That is what makes the model safe, and also
+  why very small jobs are not worth dispatching.
 - **Security.** The worker reconstructs functions from source text. Never pass
   code assembled from untrusted/user input to `runtime.task(...)`.
 - **Startup overhead & browser support.** First job pays worker startup cost;

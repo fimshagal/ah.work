@@ -1,3 +1,5 @@
+import type { TransferableValue } from "../types";
+
 /** Internal representation of a single task invocation. */
 export interface Job {
   id: string;
@@ -10,5 +12,5 @@ export interface Job {
   startedAt?: number;
   signal?: AbortSignal;
   timeout?: number;
-  transfer?: Transferable[];
+  transfer?: TransferableValue[];
 }

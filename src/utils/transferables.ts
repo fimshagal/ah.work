@@ -7,6 +7,8 @@
  * guards every environment-specific constructor behind a `typeof` check.
  */
 
+import type { TransferableValue } from "../types";
+
 function isTransferableObject(value: object): boolean {
   if (typeof MessagePort !== "undefined" && value instanceof MessagePort)
     return true;
@@ -23,7 +25,7 @@ function isTransferableObject(value: object): boolean {
   return false;
 }
 
-function walk(value: unknown, out: Set<Transferable>, seen: Set<object>): void {
+function walk(value: unknown, out: Set<TransferableValue>, seen: Set<object>): void {
   if (value === null || typeof value !== "object") return;
 
   if (value instanceof ArrayBuffer) {
@@ -38,7 +40,7 @@ function walk(value: unknown, out: Set<Transferable>, seen: Set<object>): void {
     return;
   }
   if (isTransferableObject(value)) {
-    out.add(value as Transferable);
+    out.add(value as TransferableValue);
     return;
   }
 
@@ -59,8 +61,8 @@ function walk(value: unknown, out: Set<Transferable>, seen: Set<object>): void {
 }
 
 /** Collect all transferable objects reachable from `args`. */
-export function detectTransferables(args: unknown[]): Transferable[] {
-  const out = new Set<Transferable>();
+export function detectTransferables(args: unknown[]): TransferableValue[] {
+  const out = new Set<TransferableValue>();
   walk(args, out, new Set());
   return [...out];
 }

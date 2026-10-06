@@ -1,4 +1,5 @@
 import { assertNever, type WorkerToMain } from "../protocol/messages";
+import type { WorkerLike } from "./WorkerBackend";
 import type { Job } from "../scheduler/Job";
 import { WorkerCrashedError } from "../errors/WorkerCrashedError";
 import { RuntimeError } from "../errors/RuntimeError";
@@ -90,14 +91,12 @@ export class ManagedWorker {
 
   constructor(
     readonly id: string,
-    private readonly worker: Worker,
+    private readonly worker: WorkerLike,
     private readonly resolveRegistration: ResolveRegistration,
     private readonly callbacks: ManagedWorkerCallbacks,
   ) {
-    this.worker.onmessage = (event: MessageEvent<WorkerToMain>) =>
-      this.handleMessage(event.data);
-    this.worker.onerror = (event: ErrorEvent) =>
-      this.handleCrash(event.message);
+    this.worker.onmessage = (event) => this.handleMessage(event.data);
+    this.worker.onerror = (event) => this.handleCrash(event.message);
     this.worker.onmessageerror = () =>
       this.handleCrash("Message could not be deserialized");
   }
@@ -107,6 +106,9 @@ export class ManagedWorker {
     this.state = "busy";
     this.currentJob = job;
     job.startedAt = now();
+    // A result is now expected, so the worker must hold the host open until it
+    // arrives. Released again in `settle`/`handleCrash`.
+    this.worker.ref?.();
 
     // Lazy registration: send the source only the first time this worker
     // sees the task. Message ordering guarantees it is registered before EXECUTE.
@@ -198,6 +200,7 @@ export class ManagedWorker {
 
   private settle(): void {
     if (this.state === "terminated") return;
+    this.worker.unref?.();
     this.state = "idle";
     this.lastUsedAt = now();
     this.callbacks.onSettled(this);
@@ -208,6 +211,7 @@ export class ManagedWorker {
     const job = this.currentJob;
     this.currentJob = null;
     job?.reject(error);
+    this.worker.unref?.();
     this.state = "terminated";
     this.callbacks.onCrashed(this, error);
   }

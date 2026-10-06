@@ -1,5 +1,5 @@
 import { WorkerPool, type WorkerPoolOptions } from "../workers/WorkerPool";
-import type { WorkerFactory } from "../workers/WorkerFactory";
+import type { WorkerBackend } from "../workers/WorkerBackend";
 import type {
   ManagedWorker,
   ResolveRegistration,
@@ -32,7 +32,7 @@ export class Scheduler {
   private readonly maxQueue: number;
 
   constructor(
-    factory: WorkerFactory,
+    factory: WorkerBackend,
     options: SchedulerOptions,
     resolveRegistration: ResolveRegistration,
   ) {

@@ -4,7 +4,9 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": [],
+    // Needed for `node:worker_threads` in the Node backend. DOM stays on: the
+    // two entries are compiled together and the web backend still needs it.
+    "types": ["node"],
 
     "strict": true,
     "noImplicitOverride": true,

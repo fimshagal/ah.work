@@ -5,6 +5,16 @@
  * decoupled from any Web Worker implementation detail.
  */
 
+/**
+ * A value that can be *moved* into a worker instead of copied.
+ *
+ * Deliberately not the DOM's `Transferable`: these types ship in the Node build
+ * too, where `lib.dom` is absent, and the transferable set differs per platform
+ * anyway (DOM `Transferable` vs Node `TransferListItem`). `ArrayBuffer` and
+ * `MessagePort` are the portable members; everything else depends on the host.
+ */
+export type TransferableValue = object;
+
 /** Options accepted by {@link createRuntime}. */
 export interface RuntimeOptions {
   /** Minimum number of warm workers to keep alive. Default: `0`. */
@@ -51,8 +61,8 @@ export interface RunOptions {
   signal?: AbortSignal;
   /** Per-job timeout (ms). Overrides {@link RuntimeOptions.taskTimeout}. */
   timeout?: number;
-  /** Explicit list of Transferable objects to move (zero-copy) into the worker. */
-  transfer?: Transferable[];
+  /** Explicit list of transferable objects to move (zero-copy) into the worker. */
+  transfer?: TransferableValue[];
   /**
    * Auto-detect transferables in the arguments (merged with any explicit
    * `transfer`). Overrides {@link RuntimeOptions.autoTransfer} for this call.

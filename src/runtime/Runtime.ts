@@ -8,11 +8,13 @@ import type {
   RuntimeTask,
   ShutdownOptions,
   TaskOptions,
+  TransferableValue,
 } from "../types";
 import type { Job } from "../scheduler/Job";
 import type { TaskRegistration } from "../workers/WorkerInstance";
 import { Scheduler } from "../scheduler/Scheduler";
 import { WorkerFactory } from "../workers/WorkerFactory";
+import type { WorkerBackend } from "../workers/WorkerBackend";
 import { RuntimeError } from "../errors/RuntimeError";
 import { RuntimeShutdownError } from "../errors/RuntimeShutdownError";
 import { TaskTimeoutError } from "../errors/TaskTimeoutError";
@@ -202,7 +204,7 @@ export function resolveOptions(options: RuntimeOptions): ResolvedOptions {
  */
 export class AhWorkRuntime implements Runtime {
   private readonly options: ResolvedOptions;
-  private readonly factory: WorkerFactory;
+  private readonly factory: WorkerBackend;
   private readonly scheduler: Scheduler;
   private readonly nextTaskId = createIdGenerator("task");
   private readonly nextJobId = createIdGenerator("job");
@@ -215,9 +217,15 @@ export class AhWorkRuntime implements Runtime {
   private readonly waitTime = new RunningAverage();
   private readonly executionTime = new RunningAverage();
 
-  constructor(options: RuntimeOptions = {}) {
+  /**
+   * `backend` is how a platform entry point swaps in its own worker
+   * implementation (see `index.node.ts`). It is intentionally not part of
+   * `RuntimeOptions`: callers pick a backend by importing the right entry,
+   * never by configuring it. Defaults to Web Workers.
+   */
+  constructor(options: RuntimeOptions = {}, backend?: WorkerBackend) {
     this.options = resolveOptions(options);
-    this.factory = new WorkerFactory(this.options.workerUrl);
+    this.factory = backend ?? new WorkerFactory(this.options.workerUrl);
     this.scheduler = new Scheduler(
       this.factory,
       {
@@ -355,11 +363,11 @@ export class AhWorkRuntime implements Runtime {
   private resolveTransfer(
     args: unknown[],
     options?: RunOptions,
-  ): Transferable[] | undefined {
+  ): TransferableValue[] | undefined {
     const explicit = options?.transfer;
     const auto = options?.autoTransfer ?? this.options.autoTransfer;
     if (!auto) return explicit;
-    const set = new Set<Transferable>(explicit ?? []);
+    const set = new Set<TransferableValue>(explicit ?? []);
     for (const t of detectTransferables(args)) set.add(t);
     return set.size > 0 ? [...set] : undefined;
   }

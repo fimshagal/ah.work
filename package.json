@@ -13,16 +13,36 @@
   "types": "./dist/ahwork.d.ts",
   "exports": {
     ".": {
+      "node": {
+        "types": "./dist/ahwork.node.d.ts",
+        "import": "./dist/ahwork.node.js"
+      },
+      "browser": {
+        "types": "./dist/ahwork.d.ts",
+        "import": "./dist/ahwork.js"
+      },
+      "default": {
+        "types": "./dist/ahwork.d.ts",
+        "import": "./dist/ahwork.js"
+      }
+    },
+    "./browser": {
       "types": "./dist/ahwork.d.ts",
       "import": "./dist/ahwork.js"
-    }
+    },
+    "./node": {
+      "types": "./dist/ahwork.node.d.ts",
+      "import": "./dist/ahwork.node.js"
+    },
+    "./package.json": "./package.json"
   },
   "scripts": {
     "build": "vite build",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:node": "vitest run --config vitest.node.config.ts",
     "test:browser": "playwright install chromium && vitest run --config vitest.browser.config.ts",
-    "test:all": "npm test && npm run test:browser",
+    "test:all": "npm test && npm run test:node && npm run test:browser",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "examples": "vite --config examples/vite.config.ts",
@@ -38,6 +58,7 @@
   ],
   "devDependencies": {
     "@eslint/js": "^9.13.0",
+    "@types/node": "^26.6.3",
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^4.7.0",

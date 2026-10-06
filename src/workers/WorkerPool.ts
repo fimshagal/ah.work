@@ -1,10 +1,11 @@
-import type { WorkerFactory } from "./WorkerFactory";
+import type { WorkerBackend, WorkerLike } from "./WorkerBackend";
 import {
   ManagedWorker,
   type ManagedWorkerCallbacks,
   type ResolveRegistration,
 } from "./WorkerInstance";
 import { createIdGenerator } from "../utils/ids";
+import { unrefTimer } from "../utils/timing";
 import { WorkerSpawnError } from "../errors/WorkerSpawnError";
 
 export interface WorkerPoolOptions {
@@ -39,7 +40,7 @@ export class WorkerPool {
   private readonly nextWorkerId = createIdGenerator("worker");
 
   constructor(
-    private readonly factory: WorkerFactory,
+    private readonly factory: WorkerBackend,
     private readonly options: WorkerPoolOptions,
     private readonly resolveRegistration: ResolveRegistration,
     private readonly callbacks: ManagedWorkerCallbacks,
@@ -76,7 +77,7 @@ export class WorkerPool {
    * refuses to create the worker (e.g. a strict CSP blocking blob: workers).
    */
   spawn(): ManagedWorker {
-    let raw: Worker;
+    let raw: WorkerLike;
     try {
       raw = this.factory.create();
     } catch (cause) {
@@ -122,6 +123,7 @@ export class WorkerPool {
       () => this.onIdleTimeout(worker),
       this.options.idleTimeout,
     );
+    unrefTimer(timer);
     this.idleTimers.set(worker, timer);
   }
 

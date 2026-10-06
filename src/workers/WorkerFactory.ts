@@ -1,4 +1,5 @@
 import { workerSource } from "./workerSource";
+import type { WorkerBackend, WorkerLike } from "./WorkerBackend";
 
 /**
  * Module-level shared blob URL with reference counting.
@@ -29,16 +30,17 @@ function releaseSharedUrl(): void {
 }
 
 /**
- * Creates Web Worker instances.
+ * Creates Web Worker instances — the default backend, used in browsers and in
+ * any runtime that implements the Web Worker API (Deno, Bun).
  *
- * Two backends:
+ * Two modes:
  *  - default: a shared, reference-counted `blob:` URL built from the bundled
  *    worker source (zero setup, but blocked by strict CSP).
  *  - `workerUrl`: a statically hosted worker entry, for CSP-restricted sites.
  *    The hosted file must contain AhWork's worker source (see `workerSourceCode`
  *    export). No blob is created or revoked in this mode.
  */
-export class WorkerFactory {
+export class WorkerFactory implements WorkerBackend {
   private url: string | null = null;
   private readonly usesBlob: boolean;
 
@@ -54,9 +56,9 @@ export class WorkerFactory {
     return this.url;
   }
 
-  /** Spawn a new worker from the configured backend. */
-  create(): Worker {
-    return new Worker(this.getUrl());
+  /** Spawn a new worker from the configured source. */
+  create(): WorkerLike {
+    return new Worker(this.getUrl()) as unknown as WorkerLike;
   }
 
   /** Release this factory's hold on the shared blob URL (no-op for workerUrl). */
