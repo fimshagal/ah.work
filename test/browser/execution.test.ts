@@ -8,6 +8,7 @@ import {
   RuntimeShutdownError,
   RuntimeError,
   QueueFullError,
+  workerSourceCode,
 } from "../../src";
 import type { Runtime } from "../../src";
 
@@ -15,6 +16,14 @@ import type { Runtime } from "../../src";
  * These tests need a real browser Worker (blob URL + postMessage).
  * jsdom cannot do that — that is why they live here, not in test/*.test.ts.
  */
+
+// These identifiers are resolved *inside the worker* (provided via `inject`) or
+// are intentionally absent; declared here only so the task source type-checks.
+declare const square: (x: number) => number;
+declare const dbl: (x: number) => number;
+declare const total: (x: number) => number;
+declare const mul: (x: number, f: number) => number;
+declare const missing: unknown;
 
 const runtimes: Runtime[] = [];
 
@@ -295,5 +304,134 @@ describe("AhWork in a real browser worker", () => {
     // The runtime is still healthy after the crash storm.
     expect(await dbl(21)).toBe(42);
     expect(r.stats().workers).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("AhWork round 3 features", () => {
+  it("runs via a hosted workerUrl backend (CSP escape hatch)", async () => {
+    // Emulate a hosted worker file by serving the exported source from a URL.
+    const url = URL.createObjectURL(
+      new Blob([workerSourceCode], { type: "text/javascript" }),
+    );
+    try {
+      const r = runtime({ maxWorkers: 2, workerUrl: url });
+      const square = r.task((n: number) => n * n);
+      expect(await square(9)).toBe(81);
+      expect(await square.map([2, 3, 4])).toEqual([4, 9, 16]);
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  });
+
+  it("auto-transfers ArrayBuffers zero-copy and detaches the source", async () => {
+    const r = runtime({ autoTransfer: true });
+    const sum = r.task((buf: ArrayBuffer) => {
+      const arr = new Uint8Array(buf);
+      let s = 0;
+      for (const x of arr) s += x;
+      return s;
+    });
+    const buffer = new Uint8Array([1, 2, 3, 4]).buffer;
+    expect(await sum(buffer)).toBe(10);
+    expect(buffer.byteLength).toBe(0); // detached => it was transferred, not copied
+  });
+
+  it("does not transfer when autoTransfer is off (buffer stays intact)", async () => {
+    const r = runtime(); // autoTransfer defaults to false
+    const len = r.task((buf: ArrayBuffer) => buf.byteLength);
+    const buffer = new Uint8Array([9, 9, 9]).buffer;
+    expect(await len(buffer)).toBe(3);
+    expect(buffer.byteLength).toBe(3); // copied, source intact
+  });
+
+  it("retries transient worker spawn failures and eventually succeeds", async () => {
+    const RealWorker = globalThis.Worker;
+    let failuresLeft = 2;
+    globalThis.Worker = class {
+      constructor(url: string | URL) {
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new DOMException("transient CSP", "SecurityError");
+        }
+        // Returning an object from a constructor replaces the instance.
+        return new RealWorker(url);
+      }
+    } as unknown as typeof Worker;
+    try {
+      const r = createRuntime({ maxWorkers: 1, retries: 3 });
+      const t = r.task((n: number) => n * 2);
+      expect(await t(21)).toBe(42);
+      expect(failuresLeft).toBe(0); // both transient failures were consumed
+      await r.shutdown();
+    } finally {
+      globalThis.Worker = RealWorker;
+    }
+  });
+
+  it("gives up after exhausting retries", async () => {
+    const RealWorker = globalThis.Worker;
+    globalThis.Worker = class {
+      constructor() {
+        throw new DOMException("always blocked", "SecurityError");
+      }
+    } as unknown as typeof Worker;
+    try {
+      const r = createRuntime({ maxWorkers: 1, retries: 2 });
+      const t = r.task((n: number) => n);
+      await expect(t(1)).rejects.toBeInstanceOf(WorkerSpawnError);
+      await r.shutdown();
+    } finally {
+      globalThis.Worker = RealWorker;
+    }
+  });
+
+  it("calls an injected helper function from inside the task", async () => {
+    const r = runtime();
+    const t = r.task((n: number) => square(n) + 1, {
+      inject: { square: (x: number) => x * x },
+    });
+    expect(await t(5)).toBe(26); // 25 + 1
+  });
+
+  it("supports helpers that call one another", async () => {
+    const r = runtime();
+    const t = r.task((n: number) => total(n), {
+      inject: {
+        dbl: (x: number) => x * 2,
+        total: (x: number) => dbl(x) + dbl(x), // helper calling another helper
+      },
+    });
+    expect(await t(10)).toBe(40);
+  });
+
+  it("combines inject helpers with a context argument", async () => {
+    const r = runtime();
+    const t = r.task(
+      (n: number, ctx: { factor: number }) => mul(n, ctx.factor),
+      {
+        context: { factor: 3 },
+        inject: { mul: (x: number, f: number) => x * f },
+      },
+    );
+    expect(await t(7)).toBe(21);
+  });
+
+  it("surfaces a helpful error when a non-injected helper is missing", async () => {
+    const r = runtime();
+    // `missing` is never injected -> ReferenceError inside the worker.
+    const t = r.task((n: number) => (missing as (x: number) => number)(n));
+    await expect(t(1)).rejects.toMatchObject({ name: "ReferenceError" });
+  });
+
+  it("never retries ordinary task errors", async () => {
+    const r = runtime({ retries: 5 });
+    // A RangeError is a task (application) error, not an infrastructure failure,
+    // so it is surfaced immediately and the task still works afterwards.
+    const boom = r.task((n: number) => {
+      if (n < 0) throw new RangeError("negative");
+      return n;
+    });
+    await expect(boom(-1)).rejects.toMatchObject({ name: "RangeError" });
+    expect(await boom(7)).toBe(7);
   });
 });

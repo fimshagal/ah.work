@@ -24,6 +24,11 @@ export interface RegisterTaskMessage {
   hasContext: boolean;
   /** Serialized context data (structured-clone), sent once per worker+task. */
   context?: unknown;
+  /**
+   * Named helper functions (as source text) to define in the worker scope
+   * before the task runs, so the task can call them by name.
+   */
+  inject?: Record<string, string>;
 }
 
 export interface ExecuteMessage {

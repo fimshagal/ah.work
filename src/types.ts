@@ -24,12 +24,25 @@ export interface RuntimeOptions {
    * `QueueFullError`. `0` means unbounded. Default: `0`.
    */
   maxQueue?: number;
-
-  // --- Extension points (typed now, implemented later) ---
-  // /** Use a statically hosted worker entry (for strict-CSP sites). */
-  // workerUrl?: string;
-  // /** Provide an alternative worker backend (Node, Deno, module workers...). */
-  // backend?: WorkerBackend;
+  /**
+   * Default number of automatic retries for jobs that fail due to worker
+   * *infrastructure* errors (`WorkerCrashedError`, `WorkerSpawnError`). Task
+   * errors, timeouts and aborts are never retried. Default: `0`.
+   */
+  retries?: number;
+  /**
+   * Automatically detect Transferable objects (ArrayBuffers, typed-array
+   * buffers, MessagePorts, streams, ImageBitmap, OffscreenCanvas) in task
+   * arguments and move them zero-copy. NOTE: transferring *detaches* the buffer
+   * on the main thread. Default: `false`. Can be overridden per call.
+   */
+  autoTransfer?: boolean;
+  /**
+   * Use a statically hosted worker entry instead of a `blob:` URL (for sites
+   * with a strict Content-Security-Policy that blocks blob workers). The hosted
+   * file must contain AhWork's worker source — see the `workerSourceCode` export.
+   */
+  workerUrl?: string;
 }
 
 /** Per-invocation execution options. */
@@ -40,6 +53,16 @@ export interface RunOptions {
   timeout?: number;
   /** Explicit list of Transferable objects to move (zero-copy) into the worker. */
   transfer?: Transferable[];
+  /**
+   * Auto-detect transferables in the arguments (merged with any explicit
+   * `transfer`). Overrides {@link RuntimeOptions.autoTransfer} for this call.
+   */
+  autoTransfer?: boolean;
+  /**
+   * Number of automatic retries on worker infrastructure errors for this call.
+   * Overrides {@link RuntimeOptions.retries}.
+   */
+  retries?: number;
 }
 
 /**
@@ -91,7 +114,17 @@ export interface ShutdownOptions {
   timeout?: number;
 }
 
-/** Options for {@link Runtime.task}. */
+/**
+ * A set of named helper functions made available (by name) inside the worker
+ * scope, so the task body can call them. Each helper is serialized with
+ * `fn.toString()` — exactly like the task itself — so it must be **self
+ * contained** (no closure/external variables of its own). Helpers may call one
+ * another. Keys must be valid JavaScript identifiers.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type InjectMap = Record<string, (...args: any[]) => any>;
+
+/** Options for {@link Runtime.task} (with an injected `context`). */
 export interface TaskOptions<C> {
   /**
    * Serializable data injected into the worker as the task's last argument.
@@ -101,6 +134,18 @@ export interface TaskOptions<C> {
    * compatible; it is sent once per worker and cached there.
    */
   context: C;
+  /**
+   * Helper functions made available by name inside the worker. See {@link InjectMap}.
+   */
+  inject?: InjectMap;
+}
+
+/** Options for {@link Runtime.task} when only helper functions are injected. */
+export interface InjectOptions {
+  /** Helper functions made available by name inside the worker. */
+  inject: InjectMap;
+  /** Not allowed here — use {@link TaskOptions} when you also need a context. */
+  context?: never;
 }
 
 /** The main entry object created by {@link createRuntime}. */
@@ -114,6 +159,14 @@ export interface Runtime {
   task<A extends unknown[], C, R>(
     fn: (...args: [...A, C]) => R,
     options: TaskOptions<C>,
+  ): RuntimeTask<A, R>;
+  /**
+   * Register a task with injected helper functions but no `context`. The task
+   * is called with its normal arguments; helpers are reachable by name.
+   */
+  task<A extends unknown[], R>(
+    fn: (...args: A) => R,
+    options: InjectOptions,
   ): RuntimeTask<A, R>;
   /** Return a lightweight snapshot of current runtime statistics. */
   stats(): RuntimeStats;

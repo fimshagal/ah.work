@@ -1,4 +1,6 @@
 import type {
+  InjectMap,
+  InjectOptions,
   RunOptions,
   Runtime,
   RuntimeOptions,
@@ -16,6 +18,9 @@ import { RuntimeShutdownError } from "../errors/RuntimeShutdownError";
 import { TaskTimeoutError } from "../errors/TaskTimeoutError";
 import { AbortError } from "../errors/AbortError";
 import { QueueFullError } from "../errors/QueueFullError";
+import { WorkerCrashedError } from "../errors/WorkerCrashedError";
+import { WorkerSpawnError } from "../errors/WorkerSpawnError";
+import { detectTransferables } from "../utils/transferables";
 import { createIdGenerator } from "../utils/ids";
 import { RunningAverage, now } from "../utils/timing";
 import { createRuntimeTask, type SubmitFn } from "./RuntimeTask";
@@ -27,6 +32,97 @@ interface ResolvedOptions {
   idleTimeout: number;
   taskTimeout: number;
   maxQueue: number;
+  retries: number;
+  autoTransfer: boolean;
+  workerUrl?: string;
+}
+
+/** Valid JS identifier (so injected helper names are safe to splice into source). */
+const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+/** Every identifier-shaped token in a chunk of source text. */
+const IDENTIFIER_TOKEN = /[A-Za-z_$][A-Za-z0-9_$]*/g;
+
+/** The set of identifiers that appear anywhere in `text` (strings included). */
+function identifiersIn(text: string): Set<string> {
+  return new Set(text.match(IDENTIFIER_TOKEN) ?? []);
+}
+
+/**
+ * Turn a map of helper functions into a name -> source-text map.
+ *
+ * Beyond validating the keys, this guards the one way `inject` can fail
+ * silently. A task body travels as **text** while inject keys travel as
+ * **data**, and a minifier rewrites the former but not the latter: pass an
+ * existing function by shorthand (`inject: { astar }`) and the shipped task
+ * body may call `xt(...)` while the key is still `"astar"`. Two defences:
+ *
+ *  1. every helper is published under its own `fn.name` as well, which a
+ *     minifier renames in lockstep with the call site, so the task finds it;
+ *  2. a helper that no reachable source text mentions by any of its names is
+ *     rejected here and now. Helpers exist as `var`s inside the generated
+ *     worker function, so a literal reference is the only way to reach one —
+ *     an unmentioned helper is provably uncallable, and would otherwise become
+ *     a `ReferenceError` inside the worker in production builds only.
+ */
+function serializeInject(
+  inject: InjectMap | undefined,
+  taskSource: string,
+): Record<string, string> | undefined {
+  if (!inject) return undefined;
+  const entries = Object.entries(inject);
+  if (entries.length === 0) return undefined;
+
+  const out: Record<string, string> = {};
+  for (const [name, fn] of entries) {
+    if (!IDENTIFIER.test(name)) {
+      throw new RuntimeError(
+        `Invalid inject helper name: "${name}". Names must be valid JavaScript identifiers.`,
+      );
+    }
+    if (typeof fn !== "function") {
+      throw new RuntimeError(
+        `Invalid inject helper "${name}": expected a function, got ${typeof fn}.`,
+      );
+    }
+    out[name] = fn.toString();
+  }
+
+  // (1) Alias each helper to its runtime name, which survives minification
+  // together with the call site. Never clobber a name the caller chose.
+  const aliases: Record<string, string> = {};
+  for (const [name, fn] of entries) {
+    const runtimeName = fn.name;
+    if (!runtimeName || runtimeName === name) continue;
+    if (!IDENTIFIER.test(runtimeName)) continue;
+    if (runtimeName in out || runtimeName in aliases) continue;
+    aliases[runtimeName] = out[name];
+  }
+  Object.assign(out, aliases);
+
+  // (2) A helper is reachable only if the task, or some *other* helper, names
+  // it. Its own source does not count: self-reference cannot make it callable.
+  const taskTokens = identifiersIn(taskSource);
+  const helperTokens = entries.map(([name]) => identifiersIn(out[name]));
+  for (let i = 0; i < entries.length; i++) {
+    const [name, fn] = entries[i];
+    const runtimeName = fn.name;
+    const names = runtimeName && runtimeName !== name ? [name, runtimeName] : [name];
+
+    let reachable = names.some((n) => taskTokens.has(n));
+    for (let j = 0; !reachable && j < helperTokens.length; j++) {
+      if (j !== i) reachable = names.some((n) => helperTokens[j].has(n));
+    }
+    if (reachable) continue;
+
+    throw new RuntimeError(
+      `Injected helper "${name}" is never referenced by the task or by another helper, ` +
+        `so the worker could never call it. If this task is going through a minifier, ` +
+        `the call site inside the task body was renamed but the inject key was not: ` +
+        `write the helper inline in the inject object, or nest it inside the task.`,
+    );
+  }
+
+  return out;
 }
 
 /** Coerce a user-supplied number to a finite, non-negative integer. */
@@ -86,6 +182,9 @@ export function resolveOptions(options: RuntimeOptions): ResolvedOptions {
     idleTimeout: toNonNegativeInt(options.idleTimeout, 10_000),
     taskTimeout: toNonNegativeInt(options.taskTimeout, 0),
     maxQueue: toNonNegativeInt(options.maxQueue, 0),
+    retries: toNonNegativeInt(options.retries, 0),
+    autoTransfer: options.autoTransfer === true,
+    workerUrl: options.workerUrl,
   };
 }
 
@@ -103,7 +202,7 @@ export function resolveOptions(options: RuntimeOptions): ResolvedOptions {
  */
 export class AhWorkRuntime implements Runtime {
   private readonly options: ResolvedOptions;
-  private readonly factory = new WorkerFactory();
+  private readonly factory: WorkerFactory;
   private readonly scheduler: Scheduler;
   private readonly nextTaskId = createIdGenerator("task");
   private readonly nextJobId = createIdGenerator("job");
@@ -118,6 +217,7 @@ export class AhWorkRuntime implements Runtime {
 
   constructor(options: RuntimeOptions = {}) {
     this.options = resolveOptions(options);
+    this.factory = new WorkerFactory(this.options.workerUrl);
     this.scheduler = new Scheduler(
       this.factory,
       {
@@ -135,15 +235,26 @@ export class AhWorkRuntime implements Runtime {
     fn: (...args: [...A, C]) => R,
     options: TaskOptions<C>,
   ): RuntimeTask<A, R>;
-  // Implementation signature: broad on purpose so both overloads are compatible.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  task(fn: (...args: any[]) => any, options?: TaskOptions<any>): RuntimeTask<any, any> {
+  task<A extends unknown[], R>(
+    fn: (...args: A) => R,
+    options: InjectOptions,
+  ): RuntimeTask<A, R>;
+  // Implementation signature: broad on purpose so every overload is compatible.
+  task(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    fn: (...args: any[]) => any,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    options?: TaskOptions<any> | InjectOptions,
+  ): RuntimeTask<unknown[], unknown> {
     const taskId = this.nextTaskId();
-    const hasContext = options !== undefined;
+    const hasContext = options !== undefined && "context" in options;
+    const source = fn.toString();
+
     this.tasks.set(taskId, {
-      source: fn.toString(),
+      source,
       hasContext,
-      context: options?.context,
+      context: hasContext ? (options as TaskOptions<unknown>).context : undefined,
+      inject: serializeInject(options?.inject, source),
     });
 
     // Declared callable arity (excluding an injected context), used by map().
@@ -240,6 +351,19 @@ export class AhWorkRuntime implements Runtime {
     return registration;
   }
 
+  /** Merge explicit and auto-detected transferables for a job. */
+  private resolveTransfer(
+    args: unknown[],
+    options?: RunOptions,
+  ): Transferable[] | undefined {
+    const explicit = options?.transfer;
+    const auto = options?.autoTransfer ?? this.options.autoTransfer;
+    if (!auto) return explicit;
+    const set = new Set<Transferable>(explicit ?? []);
+    for (const t of detectTransferables(args)) set.add(t);
+    return set.size > 0 ? [...set] : undefined;
+  }
+
   private submitJob<R>(
     taskId: string,
     args: unknown[],
@@ -256,11 +380,17 @@ export class AhWorkRuntime implements Runtime {
     }
 
     const signal = options?.signal;
+    // Timeout deadline spans all retry attempts (measured from first submission).
     const timeout = options?.timeout ?? this.options.taskTimeout;
+    const maxRetries = options?.retries ?? this.options.retries;
+    const transfer = this.resolveTransfer(args, options);
 
     return new Promise<Awaited<R>>((resolve, reject) => {
-      const jobId = this.nextJobId();
       let settled = false;
+      let attempts = 0;
+      let currentJobId: string | undefined;
+      // Set by timeout/abort to veto any further retries.
+      let terminalError: Error | undefined;
       let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
       let onAbort: (() => void) | undefined;
 
@@ -269,43 +399,79 @@ export class AhWorkRuntime implements Runtime {
         if (signal && onAbort) signal.removeEventListener("abort", onAbort);
       };
 
-      const job: Job = {
-        id: jobId,
-        taskId,
-        args,
-        createdAt: now(),
-        signal,
-        timeout,
-        transfer: options?.transfer,
-        resolve: (value) => {
-          if (settled) return;
-          settled = true;
-          cleanup();
+      const finalize = (settle: () => void): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        settle();
+      };
+
+      const onResult = (job: Job, value: unknown): void => {
+        finalize(() => {
           this.completedJobs += 1;
           this.recordTiming(job);
           resolve(value as Awaited<R>);
-        },
-        reject: (error) => {
-          if (settled) return;
-          settled = true;
-          cleanup();
+        });
+      };
+
+      const onError = (job: Job, error: Error): void => {
+        if (settled) return;
+        const retryable =
+          terminalError === undefined &&
+          attempts < maxRetries &&
+          (error instanceof WorkerCrashedError ||
+            error instanceof WorkerSpawnError);
+        if (retryable) {
+          attempts += 1;
+          startAttempt();
+          return;
+        }
+        finalize(() => {
           this.failedJobs += 1;
           this.recordTiming(job);
           reject(error);
-        },
+        });
+      };
+
+      const startAttempt = (): void => {
+        const jobId = this.nextJobId();
+        currentJobId = jobId;
+        const job: Job = {
+          id: jobId,
+          taskId,
+          args,
+          createdAt: now(),
+          transfer,
+          resolve: (value) => onResult(job, value),
+          reject: (error) => onError(job, error),
+        };
+        // Backpressure: a full queue rejects the job instead of growing unbounded.
+        if (!this.scheduler.submit(job)) {
+          onError(job, new QueueFullError());
+        }
+      };
+
+      // Cancel the in-flight attempt with a terminal (non-retryable) error.
+      const cancelTerminal = (error: Error): void => {
+        terminalError = error;
+        if (currentJobId !== undefined) {
+          this.scheduler.cancelJob(currentJobId, error);
+        }
       };
 
       // Already aborted before we start: reject without ever scheduling.
       if (signal?.aborted) {
-        job.reject(toAbortError(signal));
+        finalize(() => {
+          this.failedJobs += 1;
+          reject(toAbortError(signal));
+        });
         return;
       }
 
-      // Per-job timeout (deadline measured from submission). 0 = no timeout.
+      // Per-job timeout (deadline measured from first submission). 0 = none.
       if (timeout > 0) {
         timeoutTimer = setTimeout(() => {
-          this.scheduler.cancelJob(
-            jobId,
+          cancelTerminal(
             new TaskTimeoutError(`Task exceeded timeout of ${timeout}ms`),
           );
         }, timeout);
@@ -313,16 +479,11 @@ export class AhWorkRuntime implements Runtime {
 
       // AbortSignal cancellation.
       if (signal) {
-        onAbort = () => {
-          this.scheduler.cancelJob(jobId, toAbortError(signal));
-        };
+        onAbort = () => cancelTerminal(toAbortError(signal));
         signal.addEventListener("abort", onAbort, { once: true });
       }
 
-      // Backpressure: a full queue rejects the job instead of growing unbounded.
-      if (!this.scheduler.submit(job)) {
-        job.reject(new QueueFullError());
-      }
+      startAttempt();
     });
   }
 

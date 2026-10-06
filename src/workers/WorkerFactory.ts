@@ -29,31 +29,39 @@ function releaseSharedUrl(): void {
 }
 
 /**
- * Creates Web Worker instances from the shared, reference-counted Blob URL.
+ * Creates Web Worker instances.
  *
- * Each factory acquires the shared URL lazily on first use and releases it on
- * {@link dispose}. This is the one component tightly bound to Blob workers; a
- * future CSP/module backend would provide an alternative factory with the same
- * shape.
+ * Two backends:
+ *  - default: a shared, reference-counted `blob:` URL built from the bundled
+ *    worker source (zero setup, but blocked by strict CSP).
+ *  - `workerUrl`: a statically hosted worker entry, for CSP-restricted sites.
+ *    The hosted file must contain AhWork's worker source (see `workerSourceCode`
+ *    export). No blob is created or revoked in this mode.
  */
 export class WorkerFactory {
   private url: string | null = null;
+  private readonly usesBlob: boolean;
+
+  constructor(private readonly workerUrl?: string) {
+    this.usesBlob = workerUrl === undefined;
+  }
 
   private getUrl(): string {
+    if (this.workerUrl !== undefined) return this.workerUrl;
     if (this.url === null) {
       this.url = acquireSharedUrl();
     }
     return this.url;
   }
 
-  /** Spawn a new worker from the shared blob URL. */
+  /** Spawn a new worker from the configured backend. */
   create(): Worker {
     return new Worker(this.getUrl());
   }
 
-  /** Release this factory's hold on the shared blob URL. */
+  /** Release this factory's hold on the shared blob URL (no-op for workerUrl). */
   dispose(): void {
-    if (this.url !== null) {
+    if (this.usesBlob && this.url !== null) {
       this.url = null;
       releaseSharedUrl();
     }

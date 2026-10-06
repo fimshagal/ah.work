@@ -20,7 +20,15 @@ export type {
   RuntimeStats,
   ShutdownOptions,
   TaskOptions,
+  InjectOptions,
+  InjectMap,
 } from "./types";
+
+/**
+ * The raw worker runtime source. Host this string as a `.js` file and pass its
+ * URL via `createRuntime({ workerUrl })` on sites whose CSP blocks `blob:` workers.
+ */
+export { workerSource as workerSourceCode } from "./workers/workerSource";
 
 export { RuntimeError } from "./errors/RuntimeError";
 export { TaskTimeoutError } from "./errors/TaskTimeoutError";

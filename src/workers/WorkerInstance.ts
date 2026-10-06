@@ -18,13 +18,15 @@ export interface TaskRegistration {
   source: string;
   hasContext: boolean;
   context?: unknown;
+  /** Named helper functions (source text) to define in the worker scope. */
+  inject?: Record<string, string>;
 }
 
 /** Resolves a task's registration payload by its id. */
 export type ResolveRegistration = (taskId: string) => TaskRegistration;
 
 const CLOSURE_HINT =
-  "AhWork serializes tasks with fn.toString(), so closure/external variables are not available in the worker. Pass data via task(fn, { context }).";
+  "AhWork serializes tasks with fn.toString(), so closure/external variables are not available in the worker. Pass data via task(fn, { context }) and helper functions via task(fn, { inject }).";
 
 /** Rebuild an Error-like object from the serialized worker error. */
 function reconstructError(data: {
@@ -117,6 +119,7 @@ export class ManagedWorker {
           source: registration.source,
           hasContext: registration.hasContext,
           context: registration.context,
+          inject: registration.inject,
         });
         // Mark as registered only after the worker has actually received it, so
         // a failed REGISTER (e.g. non-cloneable context) does not corrupt state.

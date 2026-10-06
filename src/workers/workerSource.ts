@@ -31,8 +31,21 @@ self.onmessage = async function (event) {
   if (!msg || typeof msg.type !== "string") return;
   try {
     if (msg.type === "REGISTER_TASK") {
-      // Reconstruct the function from its source text.
-      var fn = (0, eval)("(" + msg.source + ")");
+      // Reconstruct the function from its source text. If helper functions were
+      // injected, define them as locals first and close the task over them so it
+      // can call them by name (same toString() serialization as the task).
+      var fn;
+      if (msg.inject) {
+        var names = Object.keys(msg.inject);
+        var body = "";
+        for (var i = 0; i < names.length; i++) {
+          body += "var " + names[i] + " = (" + msg.inject[names[i]] + ");\n";
+        }
+        body += "return (" + msg.source + ");";
+        fn = new Function(body)();
+      } else {
+        fn = (0, eval)("(" + msg.source + ")");
+      }
       registry.set(msg.taskId, fn);
       if (msg.hasContext) contexts.set(msg.taskId, msg.context);
       self.postMessage({ type: "TASK_REGISTERED", taskId: msg.taskId });

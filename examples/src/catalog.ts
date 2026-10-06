@@ -1,5 +1,9 @@
-import { createRuntime } from "../../src/index";
-import type { Example } from "./runnable";
+import { createRuntime, workerSourceCode } from "../../src/index";
+import type { Example } from "./types";
+
+// Resolved inside the worker via `inject` (see the "inject" example); declared
+// here only so the task source type-checks.
+declare const isPrime: (n: number) => boolean;
 
 export const examples: Example[] = [
   {
@@ -409,6 +413,231 @@ await runtime.shutdown();`,
       } catch (err) {
         log(`caught: ${(err as Error).name}: ${(err as Error).message}`);
       }
+      await runtime.shutdown();
+    },
+  },
+  {
+    id: "backpressure",
+    title: "13. Backpressure (maxQueue)",
+    description:
+      "maxQueue bounds the waiting queue. When the pool is saturated and the queue is full, extra submissions reject immediately with QueueFullError instead of growing memory unbounded.",
+    code: `const runtime = createRuntime({ maxWorkers: 1, maxQueue: 1 });
+
+const hold = runtime.task(async (ms: number) => {
+  await new Promise((r) => setTimeout(r, ms));
+  return ms;
+});
+
+const running = hold(100); // occupies the single worker
+const queued = hold(100);  // fills the queue (size 1)
+
+try {
+  await hold(100);         // over capacity
+} catch (err) {
+  console.log((err as Error).name); // QueueFullError
+}
+
+console.log(await running, await queued); // 100 100
+
+await runtime.shutdown();`,
+    run: async (log) => {
+      const runtime = createRuntime({ maxWorkers: 1, maxQueue: 1 });
+      const hold = runtime.task(async (ms: number) => {
+        await new Promise((r) => setTimeout(r, ms));
+        return ms;
+      });
+      const running = hold(100);
+      const queued = hold(100);
+      try {
+        await hold(100);
+        log("unexpectedly accepted");
+      } catch (err) {
+        log(`3rd submit rejected: ${(err as Error).name}`);
+      }
+      log(`running = ${await running}, queued = ${await queued}`);
+      await runtime.shutdown();
+    },
+  },
+  {
+    id: "dispose",
+    title: "14. Disposing a task",
+    description:
+      "task.dispose() frees the task's serialized source and cached context from the runtime and every worker. Calling it afterwards rejects with RuntimeError.",
+    code: `const runtime = createRuntime();
+
+const inc = runtime.task((n: number) => n + 1);
+console.log(await inc(1)); // 2
+
+inc.dispose();
+
+try {
+  await inc(1);
+} catch (err) {
+  console.log((err as Error).name); // RuntimeError
+}
+
+await runtime.shutdown();`,
+    run: async (log) => {
+      const runtime = createRuntime();
+      const inc = runtime.task((n: number) => n + 1);
+      log(`inc(1) = ${await inc(1)}`);
+      inc.dispose();
+      try {
+        await inc(1);
+        log("unexpectedly succeeded");
+      } catch (err) {
+        log(`after dispose: ${(err as Error).name}: ${(err as Error).message}`);
+      }
+      await runtime.shutdown();
+    },
+  },
+  {
+    id: "retries",
+    title: "15. Retries on infrastructure failures",
+    description:
+      "retries re-runs a job only when a worker fails to spawn or crashes (never on task errors / timeout / abort). Here we simulate a flaky environment where creating a Worker throws the first two times.",
+    code: `const runtime = createRuntime({ maxWorkers: 1, retries: 3 });
+
+// Infrastructure failures (WorkerSpawnError / WorkerCrashedError) are retried;
+// a transient failure recovers transparently.
+const double = runtime.task((n: number) => n * 2);
+
+console.log(await double(21)); // 42, after automatic retries
+
+await runtime.shutdown();`,
+    run: async (log) => {
+      const RealWorker = globalThis.Worker;
+      let failuresLeft = 2;
+      // Simulate a flaky environment: first 2 Worker constructions throw.
+      globalThis.Worker = class {
+        constructor(url: string | URL) {
+          if (failuresLeft > 0) {
+            failuresLeft -= 1;
+            throw new DOMException("transient failure", "SecurityError");
+          }
+          return new RealWorker(url);
+        }
+      } as unknown as typeof Worker;
+      try {
+        const runtime = createRuntime({ maxWorkers: 1, retries: 3 });
+        const double = runtime.task((n: number) => n * 2);
+        log("submitting with a flaky Worker constructor (2 failures)...");
+        log(`double(21) = ${await double(21)} (recovered via retries)`);
+        await runtime.shutdown();
+      } finally {
+        globalThis.Worker = RealWorker;
+      }
+    },
+  },
+  {
+    id: "auto-transfer",
+    title: "16. Zero-copy transfer (autoTransfer)",
+    description:
+      "With autoTransfer, ArrayBuffers (and typed-array buffers) in the arguments are moved into the worker zero-copy instead of being cloned. Transferring detaches the source on the main thread (its byteLength becomes 0).",
+    code: `const runtime = createRuntime({ autoTransfer: true });
+
+const sum = runtime.task((buf: ArrayBuffer) => {
+  const arr = new Uint8Array(buf);
+  let s = 0;
+  for (const x of arr) s += x;
+  return s;
+});
+
+const buffer = new Uint8Array([1, 2, 3, 4]).buffer;
+console.log(await sum(buffer));   // 10
+console.log(buffer.byteLength);   // 0 — detached (moved, not copied)
+
+await runtime.shutdown();`,
+    run: async (log) => {
+      const runtime = createRuntime({ autoTransfer: true });
+      const sum = runtime.task((buf: ArrayBuffer) => {
+        const arr = new Uint8Array(buf);
+        let s = 0;
+        for (const x of arr) s += x;
+        return s;
+      });
+      const buffer = new Uint8Array([1, 2, 3, 4]).buffer;
+      log(`byteLength before = ${buffer.byteLength}`);
+      log(`sum = ${await sum(buffer)}`);
+      log(`byteLength after = ${buffer.byteLength} (0 = transferred, not copied)`);
+      await runtime.shutdown();
+    },
+  },
+  {
+    id: "worker-url",
+    title: "17. Hosted worker backend (workerUrl / CSP)",
+    description:
+      "Strict Content-Security-Policy can block blob: workers. Host the exported workerSourceCode as a .js file and pass its URL via workerUrl. Here we build that URL at runtime to show the backend working.",
+    code: `import { createRuntime, workerSourceCode } from "ahwork";
+
+// In production: host workerSourceCode as /ahwork.worker.js and use that path.
+const workerUrl = URL.createObjectURL(
+  new Blob([workerSourceCode], { type: "text/javascript" }),
+);
+
+const runtime = createRuntime({ maxWorkers: 2, workerUrl });
+
+const square = runtime.task((n: number) => n * n);
+console.log(await square.map([2, 3, 4])); // [4, 9, 16]
+
+await runtime.shutdown();
+URL.revokeObjectURL(workerUrl);`,
+    run: async (log) => {
+      const workerUrl = URL.createObjectURL(
+        new Blob([workerSourceCode], { type: "text/javascript" }),
+      );
+      try {
+        const runtime = createRuntime({ maxWorkers: 2, workerUrl });
+        const square = runtime.task((n: number) => n * n);
+        log("runtime using a hosted workerUrl backend (no blob: worker)...");
+        log(`square.map([2,3,4]) = [${(await square.map([2, 3, 4])).join(", ")}]`);
+        await runtime.shutdown();
+      } finally {
+        URL.revokeObjectURL(workerUrl);
+      }
+    },
+  },
+  {
+    id: "inject",
+    title: "18. Injected helper functions (inject)",
+    description:
+      "context carries data, but structured clone cannot carry functions. Use inject to share helper functions: each is serialized like the task and rebuilt in the worker, so the task can call it by name. Helpers may call one another.",
+    code: `const runtime = createRuntime();
+
+const classify = runtime.task(
+  (n: number) => (isPrime(n) ? "prime" : "composite"),
+  {
+    inject: {
+      // self-contained helpers; they may also call each other
+      isPrime: (n: number) => {
+        if (n < 2) return false;
+        for (let i = 2; i * i <= n; i++) if (n % i === 0) return false;
+        return true;
+      },
+    },
+  },
+);
+
+console.log(await classify.map([7, 8, 13, 15])); // ["prime","composite","prime","composite"]
+
+await runtime.shutdown();`,
+    run: async (log) => {
+      const runtime = createRuntime();
+      const classify = runtime.task(
+        // `isPrime` is provided via inject, not a real closure.
+        (n: number) => (isPrime(n) ? "prime" : "composite"),
+        {
+          inject: {
+            isPrime: (n: number) => {
+              if (n < 2) return false;
+              for (let i = 2; i * i <= n; i++) if (n % i === 0) return false;
+              return true;
+            },
+          },
+        },
+      );
+      const out = await classify.map([7, 8, 13, 15]);
+      log(`classify.map([7,8,13,15]) = [${out.join(", ")}]`);
       await runtime.shutdown();
     },
   },

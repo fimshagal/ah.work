@@ -3,11 +3,10 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
+    // Build output and deps anywhere in the repo (root, examples/, demo/).
     ignores: [
-      "dist",
-      "demo/dist",
-      "node_modules",
-      "demo/node_modules",
+      "**/dist/**",
+      "**/node_modules/**",
       "playwright-report",
       "test-results",
     ],

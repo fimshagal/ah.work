@@ -7,6 +7,10 @@ import {
 } from "../src";
 import { resolveOptions } from "../src/runtime/Runtime";
 
+// Resolved inside the worker via `inject`; declared here so task sources that
+// call a helper still type-check on the main thread.
+declare const dbl: (x: number) => number;
+
 // NOTE: jsdom has no Web Worker, so these tests cover only the parts that do not
 // execute jobs (API surface, lazy worker creation, stats before any work).
 // Real execution tests (single task, concurrency, reuse, errors, shutdown) run
@@ -84,6 +88,64 @@ describe("AhWork runtime (phases 1-3, non-executing checks)", () => {
     task.dispose();
     await expect(task(1)).rejects.toBeInstanceOf(RuntimeError);
     await runtime.shutdown();
+  });
+
+  it("rejects inject helpers with invalid identifier names", () => {
+    const runtime = createRuntime();
+    expect(() =>
+      runtime.task((n: number) => n, {
+        inject: { "bad-name": () => 1 },
+      }),
+    ).toThrow(RuntimeError);
+  });
+
+  it("rejects inject helpers that are not functions", () => {
+    const runtime = createRuntime();
+    expect(() =>
+      runtime.task((n: number) => n, {
+        // @ts-expect-error intentionally not a function
+        inject: { helper: 123 },
+      }),
+    ).toThrow(RuntimeError);
+  });
+
+  it("accepts valid inject helpers at registration time", () => {
+    const runtime = createRuntime();
+    expect(() =>
+      runtime.task((n: number) => dbl(n), { inject: { dbl: (x: number) => x * 2 } }),
+    ).not.toThrow();
+  });
+
+  it("rejects an inject helper the task can never reach", () => {
+    const runtime = createRuntime();
+    // Helpers are `var`s in the worker's generated scope, so a literal mention
+    // is the only way to call one. Nothing names `dbl` here, which is also the
+    // shape the minifier bug takes: a renamed call site and an intact key.
+    expect(() =>
+      runtime.task((n: number) => n, { inject: { dbl: (x: number) => x * 2 } }),
+    ).toThrow(/never referenced/);
+  });
+
+  it("publishes an inject helper under its runtime name too", () => {
+    const runtime = createRuntime();
+    // What a minifier leaves behind: the task body calls `xt`, the key stayed
+    // `dbl`, and the function's own name was renamed along with the call site.
+    function xt(x: number): number {
+      return x * 2;
+    }
+    expect(() =>
+      runtime.task((n: number) => xt(n), { inject: { dbl: xt } }),
+    ).not.toThrow();
+  });
+
+  it("still rejects a helper when neither its key nor its name is mentioned", () => {
+    const runtime = createRuntime();
+    function helperName(x: number): number {
+      return x * 2;
+    }
+    expect(() =>
+      runtime.task((n: number) => n, { inject: { key: helperName } }),
+    ).toThrow(RuntimeError);
   });
 
   it("does not record timing for jobs that never started", async () => {
