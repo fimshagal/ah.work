@@ -155,6 +155,45 @@ describe("AhWork on node:worker_threads", () => {
     expect(await queued).toBe(100);
   });
 
+  it("runs higher-priority queued jobs first", async () => {
+    const r = runtime({ maxWorkers: 1 });
+    const order: string[] = [];
+    const work = r.task(async (tag: string) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return tag;
+    });
+
+    // The first call takes the only worker synchronously, so the rest queue.
+    const jobs = [
+      work.run(["blocker"]),
+      work.run(["low"], { priority: 0 }),
+      work.run(["high"], { priority: 10 }),
+    ].map((p) => p.then((tag) => order.push(tag)));
+
+    await Promise.all(jobs);
+    expect(order).toEqual(["blocker", "high", "low"]);
+  });
+
+  it("evicts the weakest queued job for a higher-priority one", async () => {
+    const r = runtime({
+      maxWorkers: 1,
+      maxQueue: 1,
+      onQueueFull: "evict-lowest",
+    });
+    const work = r.task(async (tag: string) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return tag;
+    });
+
+    const blocker = work.run(["blocker"]);
+    const low = work.run(["low"], { priority: 0 });
+    const high = work.run(["high"], { priority: 10 });
+
+    await expect(low).rejects.toBeInstanceOf(QueueFullError);
+    expect(await blocker).toBe("blocker");
+    expect(await high).toBe("high");
+  });
+
   it("waits for the running job on graceful shutdown", async () => {
     const r = runtime({ maxWorkers: 1 });
     const slow = r.task(async () => {

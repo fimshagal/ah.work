@@ -7,6 +7,7 @@ import type {
   RuntimeStats,
   RuntimeTask,
   ShutdownOptions,
+  QueueFullPolicy,
   TaskOptions,
   TransferableValue,
 } from "../types";
@@ -37,6 +38,8 @@ interface ResolvedOptions {
   retries: number;
   autoTransfer: boolean;
   workerUrl?: string;
+  onQueueFull: QueueFullPolicy;
+  fairness: number;
 }
 
 /** Valid JS identifier (so injected helper names are safe to splice into source). */
@@ -187,6 +190,11 @@ export function resolveOptions(options: RuntimeOptions): ResolvedOptions {
     retries: toNonNegativeInt(options.retries, 0),
     autoTransfer: options.autoTransfer === true,
     workerUrl: options.workerUrl,
+    // Anything other than the one alternative falls back to today's behaviour,
+    // so a typo degrades to plain backpressure instead of silently dropping work.
+    onQueueFull:
+      options.onQueueFull === "evict-lowest" ? "evict-lowest" : "reject",
+    fairness: toNonNegativeInt(options.fairness, 4),
   };
 }
 
@@ -233,6 +241,8 @@ export class AhWorkRuntime implements Runtime {
         maxWorkers: this.options.maxWorkers,
         idleTimeout: this.options.idleTimeout,
         maxQueue: this.options.maxQueue,
+        onQueueFull: this.options.onQueueFull,
+        fairness: this.options.fairness,
       },
       (taskId) => this.getTaskRegistration(taskId),
     );
@@ -392,6 +402,8 @@ export class AhWorkRuntime implements Runtime {
     const timeout = options?.timeout ?? this.options.taskTimeout;
     const maxRetries = options?.retries ?? this.options.retries;
     const transfer = this.resolveTransfer(args, options);
+    // Carried into every retry attempt: a crash must not demote a job.
+    const priority = options?.priority;
 
     return new Promise<Awaited<R>>((resolve, reject) => {
       let settled = false;
@@ -450,6 +462,7 @@ export class AhWorkRuntime implements Runtime {
           args,
           createdAt: now(),
           transfer,
+          priority,
           resolve: (value) => onResult(job, value),
           reject: (error) => onError(job, error),
         };

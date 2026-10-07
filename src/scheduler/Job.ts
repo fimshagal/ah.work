@@ -13,4 +13,12 @@ export interface Job {
   signal?: AbortSignal;
   timeout?: number;
   transfer?: TransferableValue[];
+  /** Higher runs sooner. Absent means `0`, which is the default level. */
+  priority?: number;
+  /**
+   * Global enqueue order, assigned by the queue. `createdAt` cannot be used for
+   * this: it is a `performance.now()` reading, so two jobs submitted in the
+   * same tick can tie, and a retried job keeps the original timestamp.
+   */
+  seq?: number;
 }

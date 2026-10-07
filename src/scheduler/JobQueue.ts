@@ -19,6 +19,25 @@ export class JobQueue {
     this.items.push(job);
   }
 
+  /** The job that would come out next, without removing it. */
+  peek(): Job | undefined {
+    return this.head < this.items.length ? this.items[this.head] : undefined;
+  }
+
+  /**
+   * Remove the **most recently** enqueued job.
+   *
+   * Used when a full queue has to make room for a higher-priority job: the
+   * newest job is the one that has invested the least waiting time, and
+   * dropping it (rather than the oldest) is what keeps the priority queue's
+   * fairness quota meaningful — otherwise the job the quota is trying to
+   * rescue would be the first one thrown away.
+   */
+  pop(): Job | undefined {
+    if (this.head >= this.items.length) return undefined;
+    return this.items.pop() as Job;
+  }
+
   dequeue(): Job | undefined {
     if (this.head >= this.items.length) return undefined;
     const job = this.items[this.head];

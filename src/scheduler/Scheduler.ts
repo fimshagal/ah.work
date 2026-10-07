@@ -4,20 +4,27 @@ import type {
   ManagedWorker,
   ResolveRegistration,
 } from "../workers/WorkerInstance";
-import { JobQueue } from "./JobQueue";
+import { PriorityQueue } from "./PriorityQueue";
 import type { Job } from "./Job";
+import type { QueueFullPolicy } from "../types";
+import { QueueFullError } from "../errors/QueueFullError";
 
-/** Pool options plus the scheduler's own waiting-queue bound. */
+/** Pool options plus the scheduler's own waiting-queue policy. */
 export interface SchedulerOptions extends WorkerPoolOptions {
   /** Max waiting jobs before submissions are rejected. `<= 0` = unbounded. */
   maxQueue?: number;
+  /** Every Nth dispatch ignores priority. `<= 0` = strict priority. */
+  fairness?: number;
+  /** What a full queue does when a higher-priority job arrives. */
+  onQueueFull?: QueueFullPolicy;
 }
 
 /**
  * Assigns queued jobs to workers and reacts to completion / crashes.
  *
- * Owns the WorkerPool so wiring stays acyclic. Scheduling is FIFO with
- * on-demand worker creation:
+ * Owns the WorkerPool so wiring stays acyclic. Dispatch order is by priority
+ * (FIFO within a level, see {@link PriorityQueue}), with on-demand worker
+ * creation:
  *   - idle worker available -> assign
  *   - below maxWorkers      -> spawn and assign
  *   - otherwise             -> keep queued (up to maxQueue)
@@ -27,9 +34,10 @@ export interface SchedulerOptions extends WorkerPoolOptions {
  */
 export class Scheduler {
   private readonly pool: WorkerPool;
-  private readonly queue = new JobQueue();
+  private readonly queue: PriorityQueue;
   private readonly runningWaiters: Array<() => void> = [];
   private readonly maxQueue: number;
+  private readonly onQueueFull: QueueFullPolicy;
 
   constructor(
     factory: WorkerBackend,
@@ -37,6 +45,8 @@ export class Scheduler {
     resolveRegistration: ResolveRegistration,
   ) {
     this.maxQueue = options.maxQueue ?? 0;
+    this.onQueueFull = options.onQueueFull ?? "reject";
+    this.queue = new PriorityQueue(options.fairness ?? 0);
     this.pool = new WorkerPool(factory, options, resolveRegistration, {
       onSettled: (worker) => this.handleSettled(worker),
       onCrashed: (worker) => this.handleCrash(worker),
@@ -46,14 +56,28 @@ export class Scheduler {
 
   /**
    * Enqueue a job and try to dispatch it. Returns `false` (without enqueuing)
-   * when the waiting queue is already at `maxQueue`; the caller should reject.
+   * when the waiting queue is full and the job may not take anyone's slot; the
+   * caller should reject.
    *
    * The queue only grows while the pool is fully saturated (dispatch always
    * drains to idle/newly-spawned workers first), so comparing against the queue
    * length is a precise backpressure signal.
+   *
+   * With `onQueueFull: "evict-lowest"` a job that **outranks** the weakest
+   * queued one takes its place; the evicted job rejects with `QueueFullError`,
+   * exactly like a refused submission, so callers need no new error type.
    */
   submit(job: Job): boolean {
-    if (this.maxQueue > 0 && this.queue.size >= this.maxQueue) return false;
+    if (this.maxQueue > 0 && this.queue.size >= this.maxQueue) {
+      if (this.onQueueFull !== "evict-lowest") return false;
+      const victim = this.queue.evictLowerThan(job.priority ?? 0);
+      if (!victim) return false;
+      victim.reject(
+        new QueueFullError(
+          "Job was evicted from a full queue by a higher-priority job.",
+        ),
+      );
+    }
     this.queue.enqueue(job);
     this.dispatch();
     return true;

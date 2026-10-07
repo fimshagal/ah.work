@@ -73,6 +73,7 @@ export type {
   InjectOptions,
   InjectMap,
   TransferableValue,
+  QueueFullPolicy,
 };
 export {
   RuntimeError,
@@ -251,6 +252,40 @@ export function Docs() {
             <td>
               Max jobs allowed to wait when saturated (backpressure). Over cap →{" "}
               <code>QueueFullError</code>. <code>0</code> = unbounded.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>onQueueFull</code>
+            </td>
+            <td>
+              <code>&quot;reject&quot; | &quot;evict-lowest&quot;</code>
+            </td>
+            <td>
+              <code>&quot;reject&quot;</code>
+            </td>
+            <td>
+              What a full queue does with a newcomer. With{" "}
+              <code>&quot;evict-lowest&quot;</code>, a job that{" "}
+              <strong>outranks</strong> the weakest queued one takes its slot
+              (the evicted job rejects with <code>QueueFullError</code>); one
+              that does not outrank it is refused as usual.
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <code>fairness</code>
+            </td>
+            <td>
+              <code>number</code>
+            </td>
+            <td>
+              <code>4</code>
+            </td>
+            <td>
+              Starvation guard: every Nth dispatch ignores priority and takes
+              the <em>oldest</em> waiting job. <code>0</code> = strict priority.
+              Invisible unless jobs use different priorities.
             </td>
           </tr>
           <tr>
@@ -525,6 +560,21 @@ export function Docs() {
               Override <code>RuntimeOptions.retries</code> for this call.
             </td>
           </tr>
+          <tr>
+            <td>
+              <code>priority</code>
+            </td>
+            <td>
+              <code>number</code>
+            </td>
+            <td>
+              Higher leaves the queue sooner; default <code>0</code>. FIFO is
+              preserved within one level. <strong>Only has an effect</strong>{" "}
+              while the pool is saturated and jobs are actually waiting — with
+              enough workers the queue is empty and this is a no-op. It buys
+              predictability under overload, not speed.
+            </td>
+          </tr>
         </tbody>
       </table>
 
@@ -593,7 +643,9 @@ export function Docs() {
               <code>QueueFullError</code>
             </td>
             <td>
-              Submission rejected because the queue hit <code>maxQueue</code>.
+              Submission rejected because the queue hit <code>maxQueue</code> —
+              or, with <code>onQueueFull: &quot;evict-lowest&quot;</code>, the
+              job was evicted from a full queue by a higher-priority one.
             </td>
           </tr>
         </tbody>

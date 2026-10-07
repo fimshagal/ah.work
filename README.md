@@ -20,8 +20,9 @@ you never call `new Worker`, `postMessage`, or `onmessage`.
 > `AbortSignal`, `context`, `inject`, stats, crash replacement, immediate and
 > graceful shutdown (with timeout + escalation), option validation, backpressure
 > (`maxQueue`), per-job `retries`, automatic transferable detection
-> (`autoTransfer`), a static-worker backend (`workerUrl`), `task.dispose()` and
-> a Node `worker_threads` backend. See [`plan.md`](./plan.md).
+> (`autoTransfer`), a static-worker backend (`workerUrl`), `task.dispose()`,
+> a Node `worker_threads` backend and job `priority` (with a starvation guard
+> and optional queue eviction). See [`plan.md`](./plan.md).
 >
 > **Not yet:** a module backend for real `import`s inside workers, a build plugin
 > for transparent closures, automatic `dist/ahwork.worker.js` emission, and the
@@ -529,6 +530,53 @@ await Promise.all([running, queued]);
 await runtime.shutdown();
 ```
 
+### Example: Job priorities
+
+`priority` decides what leaves the **queue** first — higher runs sooner, default
+`0`, and order within one level stays strictly FIFO.
+
+Read the caveat before reaching for it: priority only does something while the
+pool is saturated **and** jobs are actually waiting. With enough workers the
+queue is usually empty and this is a no-op. It buys predictability under
+overload, not speed.
+
+```ts
+const runtime = createRuntime({ maxWorkers: 2 });
+
+const plan = runtime.task((id: number) => expensiveRoute(id));
+
+// Background work for off-screen entities.
+for (const id of backgroundEntities) void plan.run([id], { priority: 0 });
+
+// The player cannot wait behind two hundred of those.
+const route = await plan.run([playerId], { priority: 10 });
+```
+
+Strict priority would let background work starve forever, so a **fairness
+quota** is on by default: every 4th dispatch ignores priority and takes the
+oldest waiting job instead. Tune it with `createRuntime({ fairness })`, or set
+`0` for strict priority.
+
+```ts
+const runtime = createRuntime({ fairness: 4 }); // default
+```
+
+When `maxQueue` is set, you can also let an important job take a slot instead of
+being refused:
+
+```ts
+const runtime = createRuntime({
+  maxWorkers: 2,
+  maxQueue: 100,
+  onQueueFull: "evict-lowest", // default is "reject"
+});
+```
+
+A newcomer that **outranks** the weakest queued job evicts it (the evicted job
+rejects with `QueueFullError`); a newcomer that does not outrank it is refused
+as usual. The strict comparison is deliberate — without it a flood of
+same-priority jobs would evict each other instead of applying backpressure.
+
 ### Example: Retries on worker failures
 
 `retries` re-runs a job **only** on infrastructure failures
@@ -627,6 +675,8 @@ createRuntime({
   idleTimeout: 10_000,  // ms an idle worker lives before termination (0 = never)
   taskTimeout: 0,       // default per-task timeout (ms); 0 = no timeout
   maxQueue: 0,          // max waiting jobs (backpressure); 0 = unbounded
+  onQueueFull: "reject",// or "evict-lowest": let a better-ranked job take a slot
+  fairness: 4,          // every Nth dispatch ignores priority; 0 = strict
   retries: 0,           // auto-retries on worker crash/spawn failure
   autoTransfer: false,  // auto-move ArrayBuffers & co. zero-copy
   // workerUrl: "/ahwork.worker.js", // hosted worker backend for strict CSP

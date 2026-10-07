@@ -15,6 +15,9 @@
  */
 export type TransferableValue = object;
 
+/** Behaviour of a saturated queue — see {@link RuntimeOptions.onQueueFull}. */
+export type QueueFullPolicy = "reject" | "evict-lowest";
+
 /** Options accepted by {@link createRuntime}. */
 export interface RuntimeOptions {
   /** Minimum number of warm workers to keep alive. Default: `0`. */
@@ -34,6 +37,25 @@ export interface RuntimeOptions {
    * `QueueFullError`. `0` means unbounded. Default: `0`.
    */
   maxQueue?: number;
+  /**
+   * What happens when the queue is at `maxQueue` and another job arrives.
+   *
+   * - `"reject"` (default): the newcomer rejects with `QueueFullError`.
+   * - `"evict-lowest"`: if the newcomer **outranks** the weakest queued job,
+   *   that job is dropped (it rejects with `QueueFullError`) and the newcomer
+   *   takes its slot. A job that does not outrank it is rejected as usual.
+   *
+   * Only meaningful together with `maxQueue` and per-job `priority`.
+   */
+  onQueueFull?: QueueFullPolicy;
+  /**
+   * Starvation guard for priorities: every `fairness`-th dispatch ignores
+   * priority and takes the **oldest** waiting job instead. `0` disables it
+   * (strict priority, low-priority work may never run under sustained load).
+   * Has no observable effect unless jobs use different priorities.
+   * Default: `4`.
+   */
+  fairness?: number;
   /**
    * Default number of automatic retries for jobs that fail due to worker
    * *infrastructure* errors (`WorkerCrashedError`, `WorkerSpawnError`). Task
@@ -73,6 +95,15 @@ export interface RunOptions {
    * Overrides {@link RuntimeOptions.retries}.
    */
   retries?: number;
+  /**
+   * Scheduling priority: **higher runs sooner**. Default: `0`.
+   *
+   * Order within one priority level stays strictly FIFO. Note that priority
+   * only has an effect while the pool is saturated *and* jobs are actually
+   * waiting — with enough workers the queue is usually empty and this is a
+   * no-op. It buys predictability under overload, not speed.
+   */
+  priority?: number;
 }
 
 /**

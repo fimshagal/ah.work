@@ -18,6 +18,7 @@ export type {
   InjectOptions,
   InjectMap,
   TransferableValue,
+  QueueFullPolicy,
 } from "./types";
 
 /**
